@@ -136,6 +136,66 @@ fn avx2_matmul_32x32x32_matches_reference() {
 }
 
 #[test]
+fn tile_4x8_matmul_16x16x16_matches_reference() {
+    // M=16 (mult of 4), N=16 (mult of 8) → 4x8 register tile path selected.
+    let src = r#"
+        fn matmul(
+            a: tensor<f32, [16, 16]>,
+            b: tensor<f32, [16, 16]>,
+        ) -> tensor<f32, [16, 16]> {
+            return a @ b;
+        }
+    "#;
+    let a: Vec<f32> = (0..256).map(|i| ((i % 11) as f32) * 0.07 - 0.3).collect();
+    let b: Vec<f32> = (0..256).map(|i| ((i % 19) as f32) * 0.02 + 0.5).collect();
+    let mut out = vec![0.0f32; 256];
+
+    compile_and_run(&X86_64::host(), src, &a, &b, &mut out);
+
+    let reference = naive_matmul(&a, &b, 16, 16, 16);
+    for (i, (got, want)) in out.iter().zip(reference.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-3,
+            "4x8 tile diverges at {}: got {} expected {}",
+            i,
+            got,
+            want
+        );
+    }
+}
+
+#[test]
+fn tile_4x8_matmul_64x64x64_matches_reference() {
+    let src = r#"
+        fn matmul(
+            a: tensor<f32, [64, 64]>,
+            b: tensor<f32, [64, 64]>,
+        ) -> tensor<f32, [64, 64]> {
+            return a @ b;
+        }
+    "#;
+    let a: Vec<f32> = (0..4096)
+        .map(|i| ((i % 23) as f32) * 0.001 - 0.05)
+        .collect();
+    let b: Vec<f32> = (0..4096).map(|i| ((i % 29) as f32) * 0.002 + 0.1).collect();
+    let mut out = vec![0.0f32; 4096];
+
+    compile_and_run(&X86_64::host(), src, &a, &b, &mut out);
+
+    let reference = naive_matmul(&a, &b, 64, 64, 64);
+    for (i, (got, want)) in out.iter().zip(reference.iter()).enumerate() {
+        // K=64 → 64 multiply-adds per output. Looser tolerance.
+        assert!(
+            (got - want).abs() < 1e-2,
+            "4x8 tile 64x64 diverges at {}: got {} expected {}",
+            i,
+            got,
+            want
+        );
+    }
+}
+
+#[test]
 fn scalar_matmul_rectangular_4x5x3() {
     let src = r#"
         fn matmul(

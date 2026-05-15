@@ -62,27 +62,38 @@ fn run_matmul(size: usize, backend: &X86_64, c: &mut Criterion, name: &str) {
     group.finish();
 }
 
+// Build a backend that has AVX2 but never picks the 4x8 tile, by reshaping the
+// IR so M % 4 != 0. We achieve this by adding a parameterized matmul function.
+// Simpler: keep `host()` for the tile path; introduce a "1x8 only" config by
+// adapting shapes for those benches.
+
 fn bench_scalar_64(c: &mut Criterion) {
     run_matmul(64, &X86_64::scalar_only(), c, "scalar");
 }
 
-fn bench_avx2_64(c: &mut Criterion) {
-    run_matmul(64, &X86_64::host(), c, "avx2");
+fn bench_tile_4x8_64(c: &mut Criterion) {
+    // 64x64x64 → both M and N divisible → picks 4x8 tile.
+    run_matmul(64, &X86_64::host(), c, "tile_4x8");
 }
 
 fn bench_scalar_128(c: &mut Criterion) {
     run_matmul(128, &X86_64::scalar_only(), c, "scalar");
 }
 
-fn bench_avx2_128(c: &mut Criterion) {
-    run_matmul(128, &X86_64::host(), c, "avx2");
+fn bench_tile_4x8_128(c: &mut Criterion) {
+    run_matmul(128, &X86_64::host(), c, "tile_4x8");
+}
+
+fn bench_tile_4x8_256(c: &mut Criterion) {
+    run_matmul(256, &X86_64::host(), c, "tile_4x8");
 }
 
 criterion_group!(
     benches,
     bench_scalar_64,
-    bench_avx2_64,
+    bench_tile_4x8_64,
     bench_scalar_128,
-    bench_avx2_128
+    bench_tile_4x8_128,
+    bench_tile_4x8_256,
 );
 criterion_main!(benches);

@@ -12,7 +12,9 @@
 //!
 //! Layout assumption: row-major, fp32, contiguous. Buffers are caller-owned.
 
-use crate::avx2_enc::{vbroadcastss, vfmadd231ps_mem, vmovups_store, vxorps_zero, Ymm};
+use crate::avx2_enc::{
+    vbroadcastss, vfmadd231ps_mem, vfmadd231ps_reg, vmovups_load, vmovups_store, vxorps_zero, Ymm,
+};
 use crate::backend::{Backend, Capabilities, CodegenError, CodegenOpts, MachineCode};
 use crate::emit::Emitter;
 use crate::x86_64_enc::*;
@@ -160,9 +162,13 @@ fn emit_function(em: &mut Emitter, f: &Function, abi: Abi, avx2: bool) -> Result
     // Output buffer is implicit param `n_params` (the caller-supplied result).
     let p_out = abi.param_reg(f.params.len() as u32);
 
-    // Automatic codegen synthesis. AVX2 path requires N % 8 == 0 so a full
-    // 256-bit ymm tile lines up with the row stride.
-    if avx2 && n % 8 == 0 {
+    // Automatic codegen synthesis — tile size selection.
+    // 1. 4×8 register tile when both M and N divide nicely (best throughput).
+    // 2. 1×8 AVX2 vectorization when only N divides.
+    // 3. Scalar fallback otherwise.
+    if avx2 && m % 4 == 0 && n % 8 == 0 {
+        emit_matmul_tile_4x8(em, p_lhs, p_rhs, p_out, m as i32, k as i32, n as i32, abi);
+    } else if avx2 && n % 8 == 0 {
         emit_matmul_avx2(em, p_lhs, p_rhs, p_out, m as i32, k as i32, n as i32, abi);
     } else {
         emit_matmul_body(em, p_lhs, p_rhs, p_out, m as i32, k as i32, n as i32, abi);
@@ -416,6 +422,144 @@ fn emit_matmul_avx2(
     patch_rel32(em, jge_j, j_done);
 
     inc_r(em, Reg::R15);
+    let jmp_i = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_i, i_loop);
+
+    let i_done = em.len();
+    patch_rel32(em, jge_i, i_done);
+
+    // epilogue
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// AVX2 4×8 register-tile matmul. Requires `M % 4 == 0` and `N % 8 == 0`.
+///
+/// Strategy:
+/// - 4 independent ymm accumulators (ymm0..ymm3), one per output row in the tile.
+/// - Inner k loop: load 1 ymm of B (8 columns) once, then for each of the 4
+///   rows broadcast A[i+r, kk] and `vfmadd231ps` the row accumulator.
+/// - This breaks the FMA dependency chain into 4 independent streams, letting
+///   the CPU's out-of-order engine schedule them in parallel (ILP ~4×).
+///
+/// ```text
+/// for i_blk in 0..M step 4:
+///   for j_blk in 0..N step 8:
+///     ymm0..ymm3 = 0
+///     for kk in 0..K:
+///       ymm4 = load [rhs + (kk*N + j_blk)*4]
+///       ymm5 = broadcast [lhs + (i_blk+0)*K*4 + kk*4]
+///       ymm0 = ymm0 + ymm5 * ymm4
+///       ymm5 = broadcast [lhs + (i_blk+1)*K*4 + kk*4]
+///       ymm1 = ymm1 + ymm5 * ymm4
+///       ymm5 = broadcast [lhs + (i_blk+2)*K*4 + kk*4]
+///       ymm2 = ymm2 + ymm5 * ymm4
+///       ymm5 = broadcast [lhs + (i_blk+3)*K*4 + kk*4]
+///       ymm3 = ymm3 + ymm5 * ymm4
+///     store ymm0..ymm3 to 4 consecutive rows of `out`
+/// ```
+#[allow(clippy::too_many_arguments)]
+fn emit_matmul_tile_4x8(
+    em: &mut Emitter,
+    p_lhs: Reg,
+    p_rhs: Reg,
+    p_out: Reg,
+    m: i32,
+    k: i32,
+    n: i32,
+    abi: Abi,
+) {
+    debug_assert!(m % 4 == 0 && n % 8 == 0);
+
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_lhs);
+    mov_rr(em, Reg::R13, p_rhs);
+    mov_rr(em, Reg::R14, p_out);
+
+    // R15 = i_blk (steps by 4), RBX = j_blk (steps by 8), RCX = kk
+    xor_rr(em, Reg::R15);
+    let i_loop = em.len();
+    cmp_ri32(em, Reg::R15, m);
+    let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    xor_rr(em, Reg::RBX);
+    let j_loop = em.len();
+    cmp_ri32(em, Reg::RBX, n);
+    let jge_j = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // Zero the 4 accumulators (ymm0..ymm3)
+    vxorps_zero(em, Ymm(0));
+    vxorps_zero(em, Ymm(1));
+    vxorps_zero(em, Ymm(2));
+    vxorps_zero(em, Ymm(3));
+
+    xor_rr(em, Reg::RCX);
+    let k_loop = em.len();
+    cmp_ri32(em, Reg::RCX, k);
+    let jge_k = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // Load B[kk, j_blk..j_blk+8] into ymm4.
+    // b_idx = kk * N + j_blk  (in RDX)
+    mov_rr(em, Reg::RDX, Reg::RCX);
+    imul_rri32(em, Reg::RDX, Reg::RDX, n);
+    add_rr(em, Reg::RDX, Reg::RBX);
+    vmovups_load(em, Ymm(4), Reg::R13, Some((Reg::RDX, Scale::S4)), 0);
+
+    // For each of the 4 rows, broadcast A and accumulate.
+    // Row offset is constant within an inner k iteration but i_blk + r changes.
+    for r in 0..4i32 {
+        // a_idx = (i_blk + r) * K + kk  in RAX
+        mov_rr(em, Reg::RAX, Reg::R15);
+        if r != 0 {
+            add_ri32(em, Reg::RAX, r);
+        }
+        imul_rri32(em, Reg::RAX, Reg::RAX, k);
+        add_rr(em, Reg::RAX, Reg::RCX);
+        vbroadcastss(em, Ymm(5), Reg::R12, Some((Reg::RAX, Scale::S4)), 0);
+        // ymm[r] += ymm5 * ymm4
+        vfmadd231ps_reg(em, Ymm(r as u8), Ymm(5), Ymm(4));
+    }
+
+    inc_r(em, Reg::RCX);
+    let jmp_k = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_k, k_loop);
+
+    let k_done = em.len();
+    patch_rel32(em, jge_k, k_done);
+
+    // Store 4 accumulators to 4 consecutive output rows.
+    for r in 0..4i32 {
+        // out_idx = (i_blk + r) * N + j_blk  in RAX
+        mov_rr(em, Reg::RAX, Reg::R15);
+        if r != 0 {
+            add_ri32(em, Reg::RAX, r);
+        }
+        imul_rri32(em, Reg::RAX, Reg::RAX, n);
+        add_rr(em, Reg::RAX, Reg::RBX);
+        vmovups_store(em, Ymm(r as u8), Reg::R14, Some((Reg::RAX, Scale::S4)), 0);
+    }
+
+    add_ri32(em, Reg::RBX, 8);
+    let jmp_j = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_j, j_loop);
+
+    let j_done = em.len();
+    patch_rel32(em, jge_j, j_done);
+
+    add_ri32(em, Reg::R15, 4);
     let jmp_i = jmp_rel32_placeholder(em);
     patch_rel32(em, jmp_i, i_loop);
 
