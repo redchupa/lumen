@@ -10,4 +10,4 @@ pub mod gguf;
 pub mod tokenizer;
 
 pub use gguf::{GgmlType, GgufError, GgufFile, KvType, KvValue, TensorInfo};
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{TokError, TokenBytes, Tokenizer};
