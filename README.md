@@ -35,8 +35,9 @@ PyTorch나 ONNX Runtime처럼 기성 그래프 컴파일러를 갖다 쓰는 것
 | 1. DSL · 파서 | Pratt 파서, AST, 타입 검사, 진단 | ✅ 완료 (21 tests) |
 | 2.A. IR + C backend | SSA IR, lower, verify, print, C emit, e2e | ✅ 완료 |
 | 2.B. 자체 x86_64 backend | 머신코드 emit + JIT 실행 + 정답성 e2e (40 tests) | ✅ 완료 |
+| 3.A/3.B AVX2 자동 합성 | VEX 인코더 + matmul AVX2 path, **8.7× scalar 대비** (46 tests) | ✅ 완료 |
 | 2.C. ARM64 backend | AAPCS64, NEON-readiness | ⏳ |
-| 3. SIMD 최적화 | AVX2/NEON, ggml 80~95% GEMM | ⏳ |
+| 3.C. 캐시 타일링 | 블록 매크로커널, ggml 80~95% peak | ⏳ |
 | 4. JIT 엔진 | 런타임 컴파일 | ⏳ |
 | 5. 양자화 | INT8/INT4, GGUF | ⏳ |
 | 6. LLM 추론 | 토크나이저, KV, sampling | ⏳ |

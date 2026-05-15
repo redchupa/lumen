@@ -6,6 +6,7 @@
 #![allow(dead_code)] // Phase 0 scaffolding.
 
 pub mod arm64;
+pub mod avx2_enc;
 pub mod backend;
 pub mod c;
 #[cfg(feature = "cuda")]

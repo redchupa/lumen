@@ -12,6 +12,7 @@
 //!
 //! Layout assumption: row-major, fp32, contiguous. Buffers are caller-owned.
 
+use crate::avx2_enc::{vbroadcastss, vfmadd231ps_mem, vmovups_store, vxorps_zero, Ymm};
 use crate::backend::{Backend, Capabilities, CodegenError, CodegenOpts, MachineCode};
 use crate::emit::Emitter;
 use crate::x86_64_enc::*;
@@ -55,16 +56,26 @@ impl Abi {
 
 pub struct X86_64 {
     pub abi: Abi,
+    /// If true, the backend may select AVX2/FMA paths when shapes allow.
+    /// Default: enabled. Set to false to force scalar codegen for testing.
+    pub avx2: bool,
 }
 
 impl X86_64 {
     pub fn host() -> Self {
         Self {
             abi: Abi::detect_host(),
+            avx2: true,
+        }
+    }
+    pub fn scalar_only() -> Self {
+        Self {
+            abi: Abi::detect_host(),
+            avx2: false,
         }
     }
     pub fn with_abi(abi: Abi) -> Self {
-        Self { abi }
+        Self { abi, avx2: true }
     }
 }
 
@@ -83,7 +94,7 @@ impl Backend for X86_64 {
         ))?;
 
         let mut em = Emitter::new();
-        emit_function(&mut em, f, self.abi)?;
+        emit_function(&mut em, f, self.abi, self.avx2)?;
         Ok(MachineCode {
             bytes: em.buf,
             entry_offset: 0,
@@ -97,7 +108,7 @@ impl Backend for X86_64 {
 
 /// Emit one function. Phase 2.B requires the body to be exactly
 /// `Param, Param, MatMul, Return` (in any order matching that shape).
-fn emit_function(em: &mut Emitter, f: &Function, abi: Abi) -> Result<(), CodegenError> {
+fn emit_function(em: &mut Emitter, f: &Function, abi: Abi, avx2: bool) -> Result<(), CodegenError> {
     // Identify the matmul op and its two operand params.
     let mut matmul_idx: Option<usize> = None;
     let mut return_src: Option<ValueId> = None;
@@ -149,7 +160,13 @@ fn emit_function(em: &mut Emitter, f: &Function, abi: Abi) -> Result<(), Codegen
     // Output buffer is implicit param `n_params` (the caller-supplied result).
     let p_out = abi.param_reg(f.params.len() as u32);
 
-    emit_matmul_body(em, p_lhs, p_rhs, p_out, m as i32, k as i32, n as i32, abi);
+    // Automatic codegen synthesis. AVX2 path requires N % 8 == 0 so a full
+    // 256-bit ymm tile lines up with the row stride.
+    if avx2 && n % 8 == 0 {
+        emit_matmul_avx2(em, p_lhs, p_rhs, p_out, m as i32, k as i32, n as i32, abi);
+    } else {
+        emit_matmul_body(em, p_lhs, p_rhs, p_out, m as i32, k as i32, n as i32, abi);
+    }
     Ok(())
 }
 
@@ -295,6 +312,117 @@ fn emit_matmul_body(
     patch_rel32(em, jge_i, i_done);
 
     // ---- epilogue ----
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// AVX2 matmul. Requires `N % 8 == 0`. Processes 8 columns of the output at a
+/// time using a single ymm accumulator.
+///
+/// ```text
+/// for i in 0..M:
+///   for j in 0..N step 8:
+///     ymm_acc = 0
+///     for kk in 0..K:
+///       ymm0 = broadcast(lhs[i*K + kk])
+///       ymm_acc += ymm0 * [rhs + (kk*N + j)*4]   (vfmadd231ps with mem operand)
+///     store [out + (i*N + j)*4] = ymm_acc
+/// ```
+///
+/// Same prologue/epilogue and same register convention as `emit_matmul_body`
+/// so the two paths are interchangeable from the JIT's point of view.
+#[allow(clippy::too_many_arguments)]
+fn emit_matmul_avx2(
+    em: &mut Emitter,
+    p_lhs: Reg,
+    p_rhs: Reg,
+    p_out: Reg,
+    m: i32,
+    k: i32,
+    n: i32,
+    abi: Abi,
+) {
+    debug_assert!(n % 8 == 0, "AVX2 path requires N % 8 == 0");
+
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_lhs);
+    mov_rr(em, Reg::R13, p_rhs);
+    mov_rr(em, Reg::R14, p_out);
+
+    // R15 = i, RBX = j (column block, stepped by 8), RCX = kk
+    xor_rr(em, Reg::R15);
+    let i_loop = em.len();
+    cmp_ri32(em, Reg::R15, m);
+    let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    xor_rr(em, Reg::RBX);
+    let j_loop = em.len();
+    cmp_ri32(em, Reg::RBX, n);
+    let jge_j = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // ymm0 (acc) = 0
+    vxorps_zero(em, Ymm(0));
+
+    xor_rr(em, Reg::RCX); // kk = 0
+    let k_loop = em.len();
+    cmp_ri32(em, Reg::RCX, k);
+    let jge_k = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // ymm1 = broadcast(lhs[i*K + kk])
+    // a_addr_index = i * K + kk  (in RAX)
+    mov_rr(em, Reg::RAX, Reg::R15);
+    imul_rri32(em, Reg::RAX, Reg::RAX, k);
+    add_rr(em, Reg::RAX, Reg::RCX);
+    vbroadcastss(em, Ymm(1), Reg::R12, Some((Reg::RAX, Scale::S4)), 0);
+
+    // b_addr_index = kk * N + j  (in RDX)
+    mov_rr(em, Reg::RDX, Reg::RCX);
+    imul_rri32(em, Reg::RDX, Reg::RDX, n);
+    add_rr(em, Reg::RDX, Reg::RBX);
+    // ymm0 += ymm1 * [rhs + RDX*4]
+    vfmadd231ps_mem(em, Ymm(0), Ymm(1), Reg::R13, Some((Reg::RDX, Scale::S4)), 0);
+
+    inc_r(em, Reg::RCX);
+    let jmp_k = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_k, k_loop);
+
+    let k_done = em.len();
+    patch_rel32(em, jge_k, k_done);
+
+    // store [out + (i*N + j)*4] = ymm0
+    mov_rr(em, Reg::RAX, Reg::R15);
+    imul_rri32(em, Reg::RAX, Reg::RAX, n);
+    add_rr(em, Reg::RAX, Reg::RBX);
+    vmovups_store(em, Ymm(0), Reg::R14, Some((Reg::RAX, Scale::S4)), 0);
+
+    add_ri32(em, Reg::RBX, 8); // j += 8
+    let jmp_j = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_j, j_loop);
+
+    let j_done = em.len();
+    patch_rel32(em, jge_j, j_done);
+
+    inc_r(em, Reg::R15);
+    let jmp_i = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_i, i_loop);
+
+    let i_done = em.len();
+    patch_rel32(em, jge_i, i_done);
+
+    // epilogue
     add_ri32(em, Reg::RSP, extra);
     pop_r64(em, Reg::RBX);
     pop_r64(em, Reg::R15);
