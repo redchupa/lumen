@@ -9,5 +9,5 @@ pub mod arch;
 pub mod gguf;
 pub mod tokenizer;
 
-pub use gguf::GgufFile;
+pub use gguf::{GgmlType, GgufError, GgufFile, KvType, KvValue, TensorInfo};
 pub use tokenizer::Tokenizer;
