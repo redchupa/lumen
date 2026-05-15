@@ -363,6 +363,45 @@ pub fn vbroadcastss_xmm(em: &mut Emitter, dst: Ymm, src: Ymm) {
     em.u8(0b11_000_000 | (dst.low3() << 3) | src.low3());
 }
 
+/// `vcvtsi2ss xmm_dst, xmm_src1, r32_src2` — convert i32 in `src2` to fp32 in
+/// the low lane of `dst`. The upper lanes inherit from `src1`.
+///
+/// Encoding: VEX.NDS.LIG.F3.0F.W0 2A /r  (reg form)
+pub fn vcvtsi2ss_xmm_r32(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Reg) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        0, // L=0 (LIG)
+        Prefix::PF3,
+    );
+    em.u8(0x2A);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vmulss xmm_dst, xmm_src1, xmm_src2` — scalar fp32 multiply (low lane only).
+///
+/// Encoding: VEX.NDS.LIG.F3.0F.WIG 59 /r
+pub fn vmulss_xmm(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        0,
+        Prefix::PF3,
+    );
+    em.u8(0x59);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
 // ---- shared ModR/M+SIB+disp32 emission ----------------------------------
 
 fn emit_modrm_sib_disp32(
@@ -480,5 +519,22 @@ mod tests {
         assert!(bytes.contains(&0x18));
         // last byte is ModR/M with mod=11
         assert!(bytes[bytes.len() - 1] & 0b1100_0000 == 0b1100_0000);
+    }
+
+    #[test]
+    fn encodes_vcvtsi2ss_xmm_r32() {
+        // vcvtsi2ss xmm0, xmm0, eax
+        let bytes = enc(|e| vcvtsi2ss_xmm_r32(e, Ymm(0), Ymm(0), Reg::RAX));
+        // 2-byte VEX: C5 [R̄=1 vvvv=1111(~0) L=0 pp=10(F3)] = C5 FA, opcode 2A, ModR/M
+        assert_eq!(bytes[0], 0xC5);
+        assert!(bytes.contains(&0x2A));
+    }
+
+    #[test]
+    fn encodes_vmulss_xmm() {
+        // vmulss xmm0, xmm0, xmm0
+        let bytes = enc(|e| vmulss_xmm(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert_eq!(bytes[0], 0xC5);
+        assert!(bytes.contains(&0x59));
     }
 }

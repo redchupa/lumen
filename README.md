@@ -36,7 +36,10 @@ PyTorch나 ONNX Runtime처럼 기성 그래프 컴파일러를 갖다 쓰는 것
 | 2.A. IR + C backend | SSA IR, lower, verify, print, C emit, e2e | ✅ 완료 |
 | 2.B. 자체 x86_64 backend | 머신코드 emit + JIT 실행 + 정답성 e2e (40 tests) | ✅ 완료 |
 | 3.A/3.B AVX2 자동 합성 | VEX 인코더 + matmul AVX2 path, 8.7× scalar 대비 | ✅ 완료 |
-| 3.C. Register tile 4×8 | 4 독립 accumulator, **57 GFLOPS / 19× scalar** (48 tests) | ✅ 완료 |
+| 3.C. Register tile 4×8 | 4 독립 accumulator, 57 GFLOPS / 19× scalar | ✅ 완료 |
+| 5.A. 양자화 reference | Q4_0/Q8_0 dequant in pure Rust (5 tests) | ✅ 완료 |
+| 5.B. Native Q8 dequant | F16C+AVX2, IR Op::Dequantize 자동 합성 | ✅ 완료 |
+| 5.C. **Q8 × F32 fused matmul** | dequant×matmul 패턴 자동 융합, 65 tests | ✅ 완료 |
 | 2.C. ARM64 backend | AAPCS64, NEON-readiness | ⏳ |
 | 3.D. 캐시 타일링 | 블록 매크로커널, 256³+ 큰 사이즈 유지 | ⏳ |
 | 4. JIT 엔진 | 런타임 컴파일 | ⏳ |

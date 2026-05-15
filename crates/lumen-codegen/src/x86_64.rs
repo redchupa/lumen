@@ -13,8 +13,9 @@
 //! Layout assumption: row-major, fp32, contiguous. Buffers are caller-owned.
 
 use crate::avx2_enc::{
-    vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm, vfmadd231ps_mem, vfmadd231ps_reg,
-    vmovd_load, vmovups_load, vmovups_store, vmulps_reg, vpmovsxbd_load, vxorps_zero, Ymm,
+    vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm, vcvtsi2ss_xmm_r32, vfmadd231ps_mem,
+    vfmadd231ps_reg, vmovd_load, vmovups_load, vmovups_store, vmulps_reg, vmulss_xmm,
+    vpmovsxbd_load, vxorps_zero, Ymm,
 };
 use crate::backend::{Backend, Capabilities, CodegenError, CodegenOpts, MachineCode};
 use crate::emit::Emitter;
@@ -109,16 +110,29 @@ impl Backend for X86_64 {
 // Function emission
 // ============================================================================
 
-/// Emit one function. Two patterns supported:
-/// - matmul:    `Param, Param, MatMul, Return`           (Phase 2.B/3)
-/// - dequant:   `Param, Dequantize, Return`              (Phase 5.B, Q8_0 only)
+/// Emit one function. Three patterns supported:
+/// - quant matmul: `Param(q8_0), Param(f32), Dequantize, MatMul, Return`  (Phase 5.C)
+/// - matmul:       `Param, Param, MatMul, Return`                         (Phase 2.B/3)
+/// - dequant:      `Param, Dequantize, Return`                            (Phase 5.B)
 fn emit_function(em: &mut Emitter, f: &Function, abi: Abi, avx2: bool) -> Result<(), CodegenError> {
-    // Try dequantize pattern first: a single Dequantize op whose source is a Param.
-    if let Some(dq_idx) = f
+    let has_dequant = f
         .values
         .iter()
-        .position(|v| matches!(v.op, Op::Dequantize { .. }))
-    {
+        .any(|v| matches!(v.op, Op::Dequantize { .. }));
+    let has_matmul = f.values.iter().any(|v| matches!(v.op, Op::MatMul { .. }));
+
+    // Pattern 1: dequant fused with matmul → on-the-fly quant matmul.
+    if has_dequant && has_matmul {
+        return emit_function_quant_matmul_q8(em, f, abi);
+    }
+
+    // Pattern 2: standalone dequant.
+    if has_dequant {
+        let dq_idx = f
+            .values
+            .iter()
+            .position(|v| matches!(v.op, Op::Dequantize { .. }))
+            .unwrap();
         return emit_function_dequant(em, f, dq_idx, abi);
     }
 
@@ -426,6 +440,273 @@ fn emit_matmul_avx2(
     vmovups_store(em, Ymm(0), Reg::R14, Some((Reg::RAX, Scale::S4)), 0);
 
     add_ri32(em, Reg::RBX, 8); // j += 8
+    let jmp_j = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_j, j_loop);
+
+    let j_done = em.len();
+    patch_rel32(em, jge_j, j_done);
+
+    inc_r(em, Reg::R15);
+    let jmp_i = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_i, i_loop);
+
+    let i_done = em.len();
+    patch_rel32(em, jge_i, i_done);
+
+    // epilogue
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// Emit a fused quantized matmul: Q8_0 weights × F32 activations → F32 output.
+///
+/// Source IR:
+/// ```text
+///   v0 = Param(0): tensor<q8_0, [M, K]>     # weights (quantized)
+///   v1 = Param(1): tensor<f32,  [K, N]>     # activations
+///   v2 = Dequantize v0 : tensor<f32, [M, K]>
+///   v3 = MatMul v2, v1 : tensor<f32, [M, N]>
+///   return v3
+/// ```
+///
+/// Lumen recognizes this as one fused kernel and emits a single loop nest
+/// that *never* materializes the full dequantized weight matrix. K must be
+/// a multiple of 32 (Q8_0 block size). N must be a multiple of 8 (AVX2 row).
+///
+/// Generated pseudo-asm:
+/// ```text
+///   for i in 0..M:
+///     for j in 0..N step 8:
+///       ymm_acc = 0
+///       for kb in 0..K/32:               ; block index
+///         load fp16 d, convert -> xmm_d
+///         for kk in 0..32:               ; in-block element
+///           movsx eax, byte [weights + (i*KB + kb)*34 + 2 + kk]
+///           vcvtsi2ss xmm_w, xmm_w, eax
+///           vmulss    xmm_w, xmm_w, xmm_d
+///           vbroadcastss ymm_w, xmm_w
+///           vfmadd231ps ymm_acc, ymm_w, [activations + ((kb*32 + kk)*N + j)*4]
+///       store ymm_acc -> out[i, j..j+8]
+/// ```
+fn emit_function_quant_matmul_q8(
+    em: &mut Emitter,
+    f: &Function,
+    abi: Abi,
+) -> Result<(), CodegenError> {
+    // Locate the ops and verify the pattern.
+    let dq_idx = f
+        .values
+        .iter()
+        .position(|v| matches!(v.op, Op::Dequantize { .. }))
+        .unwrap();
+    let mm_idx = f
+        .values
+        .iter()
+        .position(|v| matches!(v.op, Op::MatMul { .. }))
+        .ok_or(CodegenError::UnsupportedOp("missing matmul".into()))?;
+
+    let Op::Dequantize { x: dq_src } = f.values[dq_idx].op else {
+        unreachable!()
+    };
+    let Op::MatMul { lhs, rhs } = f.values[mm_idx].op else {
+        unreachable!()
+    };
+
+    if lhs != lumen_ir::ValueId(dq_idx as u32) {
+        return Err(CodegenError::UnsupportedOp(
+            "Phase 5.C: matmul LHS must be the Dequantize result".into(),
+        ));
+    }
+
+    let w_ty = f.values[dq_src.0 as usize].ty.clone();
+    let a_ty = f.values[rhs.0 as usize].ty.clone();
+    if w_ty.dtype != DType::Q8_0 {
+        return Err(CodegenError::UnsupportedOp(
+            "Phase 5.C: only Q8_0 weights supported".into(),
+        ));
+    }
+    if a_ty.dtype != DType::F32 {
+        return Err(CodegenError::UnsupportedOp(
+            "Phase 5.C: activations must be f32".into(),
+        ));
+    }
+    let (m, k) = static_2d(&w_ty)?;
+    let (k_a, n) = static_2d(&a_ty)?;
+    if k != k_a {
+        return Err(CodegenError::ShapeError(
+            "Phase 5.C: matmul inner-dim mismatch".into(),
+        ));
+    }
+    if k % 32 != 0 {
+        return Err(CodegenError::ShapeError(
+            "Phase 5.C: K must be a multiple of 32 (Q8_0 block size)".into(),
+        ));
+    }
+    if n % 8 != 0 {
+        return Err(CodegenError::ShapeError(
+            "Phase 5.C: N must be a multiple of 8 (AVX2 row width)".into(),
+        ));
+    }
+
+    let w_param = match f.values[dq_src.0 as usize].op {
+        Op::Param { index } => index,
+        _ => {
+            return Err(CodegenError::UnsupportedOp(
+                "dequant source must be Param".into(),
+            ))
+        }
+    };
+    let a_param = match f.values[rhs.0 as usize].op {
+        Op::Param { index } => index,
+        _ => {
+            return Err(CodegenError::UnsupportedOp(
+                "matmul RHS must be Param".into(),
+            ))
+        }
+    };
+
+    let p_w = abi.param_reg(w_param);
+    let p_a = abi.param_reg(a_param);
+    let p_out = abi.param_reg(f.params.len() as u32);
+
+    emit_quant_matmul_q8_body(em, p_w, p_a, p_out, m as i32, k as i32, n as i32, abi);
+    Ok(())
+}
+
+/// Body of the Q8 × F32 fused matmul.
+///
+/// Stack layout (inside the function, after prologue + adjustment):
+/// - R12 = weights base (q8_0 blocks)
+/// - R13 = activations base (f32)
+/// - R14 = output base (f32)
+/// - R15 = i (row of weights / output)
+/// - RBX = j (column block of output, step 8)
+/// - R11 = kb (block index along K)
+/// - RCX = kk (element within block, 0..32)
+///
+/// Block stride for weights = num_K_blocks per row × 34 bytes.
+///   weight row byte offset (for row i) = i * (K/32) * 34.
+///   block byte offset within row = kb * 34.
+/// Stride for activations: each row is N floats = 4*N bytes.
+#[allow(clippy::too_many_arguments)]
+fn emit_quant_matmul_q8_body(
+    em: &mut Emitter,
+    p_w: Reg,
+    p_a: Reg,
+    p_out: Reg,
+    m: i32,
+    k: i32,
+    n: i32,
+    abi: Abi,
+) {
+    let k_blocks = k / 32;
+    let row_w_bytes = k_blocks * 34;
+
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    // R11 doesn't need preservation in Windows or SysV ABI (caller-saved).
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_w);
+    mov_rr(em, Reg::R13, p_a);
+    mov_rr(em, Reg::R14, p_out);
+
+    xor_rr(em, Reg::R15); // i = 0
+    let i_loop = em.len();
+    cmp_ri32(em, Reg::R15, m);
+    let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    xor_rr(em, Reg::RBX); // j = 0
+    let j_loop = em.len();
+    cmp_ri32(em, Reg::RBX, n);
+    let jge_j = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // ymm0 = accumulator = 0
+    vxorps_zero(em, Ymm(0));
+
+    xor_rr(em, Reg::R11); // kb = 0
+    let kb_loop = em.len();
+    cmp_ri32(em, Reg::R11, k_blocks);
+    let jge_kb = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // weight row byte offset RDX = i * row_w_bytes
+    mov_rr(em, Reg::RDX, Reg::R15);
+    imul_rri32(em, Reg::RDX, Reg::RDX, row_w_bytes);
+    // weight block byte offset RAX = RDX + kb*34
+    mov_rr(em, Reg::RAX, Reg::R11);
+    imul_rri32(em, Reg::RAX, Reg::RAX, 34);
+    add_rr(em, Reg::RAX, Reg::RDX);
+    // Now RAX = byte offset of this Q8_0 block within R12 base.
+
+    // Load fp16 d at [R12 + RAX], convert to fp32 in xmm_d (xmm2)
+    vmovd_load(em, Ymm(2), Reg::R12, Some((Reg::RAX, Scale::S1)), 0);
+    vcvtph2ps_xmm(em, Ymm(2), Ymm(2));
+
+    // 32 inner iterations
+    xor_rr(em, Reg::RCX); // kk = 0
+    let kk_loop = em.len();
+    cmp_ri32(em, Reg::RCX, 32);
+    let jge_kk = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // movsx r9d, byte [R12 + RAX + 2 + RCX]
+    // R12 base + RAX (block offset) + 2 (skip d) + RCX (in-block idx)
+    // We can't have 3 registers, so combine: RAX_temp = RAX + RCX
+    // Use R8 as scratch for the byte addr index.
+    // Simpler: mov tmp = RAX; add tmp, RCX; load [R12 + tmp + 2]
+    mov_rr(em, Reg::R8, Reg::RAX);
+    add_rr(em, Reg::R8, Reg::RCX);
+    movsx_r32_m8(em, Reg::R9, Reg::R12, Some((Reg::R8, Scale::S1)), 2);
+
+    // vcvtsi2ss xmm1, xmm2 (any), R9d → xmm1 = (float)i32(R9), upper inherits from xmm2
+    vcvtsi2ss_xmm_r32(em, Ymm(1), Ymm(2), Reg::R9);
+    // vmulss xmm1, xmm1, xmm2 → xmm1 = w * d
+    vmulss_xmm(em, Ymm(1), Ymm(1), Ymm(2));
+    // vbroadcastss ymm1, xmm1 → broadcast scaled weight
+    vbroadcastss_xmm(em, Ymm(1), Ymm(1));
+
+    // Compute activation byte offset:
+    //   act_idx = (kb*32 + kk) * N + j   (in floats)
+    //   byte offset = act_idx * 4
+    // act_row_idx (in floats) = (kb*32 + kk)*N  in R8 (reuse)
+    mov_rr(em, Reg::R8, Reg::R11);
+    imul_rri32(em, Reg::R8, Reg::R8, 32);
+    add_rr(em, Reg::R8, Reg::RCX);
+    imul_rri32(em, Reg::R8, Reg::R8, n);
+    add_rr(em, Reg::R8, Reg::RBX);
+    // FMA: ymm0 += ymm1 * [R13 + R8*4]
+    vfmadd231ps_mem(em, Ymm(0), Ymm(1), Reg::R13, Some((Reg::R8, Scale::S4)), 0);
+
+    inc_r(em, Reg::RCX);
+    let jmp_kk = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_kk, kk_loop);
+
+    let kk_done = em.len();
+    patch_rel32(em, jge_kk, kk_done);
+
+    inc_r(em, Reg::R11);
+    let jmp_kb = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_kb, kb_loop);
+
+    let kb_done = em.len();
+    patch_rel32(em, jge_kb, kb_done);
+
+    // Store output row: [R14 + (i*N + j)*4]
+    mov_rr(em, Reg::RAX, Reg::R15);
+    imul_rri32(em, Reg::RAX, Reg::RAX, n);
+    add_rr(em, Reg::RAX, Reg::RBX);
+    vmovups_store(em, Ymm(0), Reg::R14, Some((Reg::RAX, Scale::S4)), 0);
+
+    add_ri32(em, Reg::RBX, 8);
     let jmp_j = jmp_rel32_placeholder(em);
     patch_rel32(em, jmp_j, j_loop);
 

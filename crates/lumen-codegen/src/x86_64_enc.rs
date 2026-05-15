@@ -203,6 +203,29 @@ pub fn ret(em: &mut Emitter) {
     em.u8(0xC3);
 }
 
+/// `movsx dst32, byte ptr [base + index*scale + disp32]` — sign-extend an 8-bit
+/// value from memory into a 32-bit destination register. Encoding: `0F BE /r`.
+pub fn movsx_r32_m8(em: &mut Emitter, dst: Reg, base: Reg, index: Option<(Reg, Scale)>, disp: i32) {
+    // REX needed if any reg uses upper bank (dst high or base high or index high).
+    let r = dst.high1();
+    let x = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    let b = base.high1();
+    if r != 0 || x != 0 || b != 0 {
+        em.u8(0x40 | (r << 2) | (x << 1) | b);
+    }
+    em.u8(0x0F);
+    em.u8(0xBE);
+    if let Some((idx, scale)) = index {
+        em.u8(modrm(0b10, dst.low3(), 0b100));
+        em.u8(sib(scale, idx.low3(), base.low3()));
+        em.u32(disp as u32);
+    } else {
+        debug_assert!(base.low3() != 0b100, "use SIB form when base is RSP/R12");
+        em.u8(modrm(0b10, dst.low3(), base.low3()));
+        em.u32(disp as u32);
+    }
+}
+
 // ======================================================================
 // SSE scalar single-precision instructions
 // ======================================================================
