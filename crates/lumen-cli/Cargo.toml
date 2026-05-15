@@ -1,0 +1,21 @@
+[package]
+name = "lumen-cli"
+description = "Lumen CLI — `lumen run`, `lumen compile`, `lumen bench`"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lumen"
+path = "src/main.rs"
+
+[dependencies]
+lumen-dsl.workspace = true
+lumen-ir.workspace = true
+lumen-codegen.workspace = true
+lumen-jit.workspace = true
+lumen-runtime.workspace = true
+lumen-model.workspace = true

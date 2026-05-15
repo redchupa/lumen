@@ -1,0 +1,16 @@
+[package]
+name = "lumen-ir"
+description = "Lumen IR — SSA form, tensor shapes as types, pass manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+lumen-dsl.workspace = true
+thiserror.workspace = true

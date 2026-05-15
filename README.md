@@ -1,0 +1,53 @@
+# Lumen
+
+> **IR이 양자화 커널을 자동 합성하는** LLM 추론 컴파일러 + 런타임.
+> 한국어 LLM(EXAONE, HyperCLOVA-X, A.X) 추론도 1급으로 지원.
+
+[![Build](https://img.shields.io/badge/build-WIP-yellow)](#) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#) [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](#)
+
+---
+
+## What is this?
+
+Lumen은 **LLM 추론을 위한 컴파일러 + 런타임**입니다.
+PyTorch나 ONNX Runtime처럼 기성 그래프 컴파일러를 갖다 쓰는 것이 아니라,
+
+- 자체 텐서 **DSL**(언어)
+- 자체 **IR**(중간표현, SSA 기반, 텐서 형상이 타입)
+- 자체 **코드 생성기**(x86_64 · ARM64 · CUDA)
+- 자체 **JIT**(런타임에 입력 형상 보고 특화 커널 생성)
+
+까지 전부 직접 짭니다. 외부 의존: 표준 라이브러리, OS, 하드웨어.
+
+## Why?
+
+**llama.cpp**는 훌륭하지만 — 양자화 × dtype × 형상 조합별로 사람이 손으로 커널을 짭니다 (`ggml_vec_dot_q4_0_q8_0`, `ggml_vec_dot_q4_K_q8_K`, ...). 수백 개의 함수가 손코딩.
+
+**Lumen**은 IR 레벨에서 `tensor<q4_0, ...> @ tensor<f16, ...>`을 보면 **unpack + dequantize + matmul + requantize를 자동 융합**해 한 덩어리 커널을 emit합니다. 새 양자화 포맷이 등장해도 IR 변경만으로 모든 백엔드에 전파됩니다.
+
+**한국어 LLM**은 토크나이저 효율과 RoPE 변형에서 외산 런타임이 자주 헛돈을 둡니다. Lumen은 한국어 모델을 정답성 테스트 케이스의 1급 시민으로 둡니다.
+
+## Roadmap (요약)
+
+| Phase | 산출물 | 상태 |
+|---|---|---|
+| 0. 설계 | 아키텍처 문서, 워크스페이스 | 🚧 진행 중 |
+| 1. DSL · 파서 | Pratt 파서, AST, 타입 | ⏳ |
+| 2. IR · 코드 생성 | x86_64/ARM64, matmul | ⏳ |
+| 3. SIMD 최적화 | AVX2/NEON, 90% peak GEMM | ⏳ |
+| 4. JIT 엔진 | 런타임 컴파일 | ⏳ |
+| 5. 양자화 | INT8/INT4, GGUF | ⏳ |
+| 6. LLM 추론 | 토크나이저, KV, sampling | ⏳ |
+| 7. 벤치 · 블로그 | vs llama.cpp | ⏳ |
+
+상세 계획: [PLAN.md](./PLAN.md) · 아키텍처: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
+
+## Non-goals
+
+- 학습(training) 지원 — 추론 전용
+- 그래프 시각화/디버거 — 별도 도구로 분리
+- 100개 모델 지원 — 한국어 모델 6종 + Qwen 계열만
+
+## License
+
+Apache-2.0

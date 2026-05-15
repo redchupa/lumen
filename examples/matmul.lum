@@ -1,0 +1,9 @@
+// First Lumen example. Phase 1 parser will need to handle this.
+// Static shapes in the type system are the whole point of the IR.
+
+fn matmul(
+    a: tensor<f32, [64, 128]>,
+    b: tensor<f32, [128, 32]>,
+) -> tensor<f32, [64, 32]> {
+    return a @ b;
+}

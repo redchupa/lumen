@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lumen-dsl",
+    "crates/lumen-ir",
+    "crates/lumen-codegen",
+    "crates/lumen-jit",
+    "crates/lumen-runtime",
+    "crates/lumen-model",
+    "crates/lumen-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.78"
+license = "Apache-2.0"
+repository = "https://github.com/redchupa/lumen"
+authors = ["Lumen contributors"]
+
+[workspace.dependencies]
+# Internal crates
+lumen-dsl = { path = "crates/lumen-dsl", version = "0.0.1" }
+lumen-ir = { path = "crates/lumen-ir", version = "0.0.1" }
+lumen-codegen = { path = "crates/lumen-codegen", version = "0.0.1" }
+lumen-jit = { path = "crates/lumen-jit", version = "0.0.1" }
+lumen-runtime = { path = "crates/lumen-runtime", version = "0.0.1" }
+lumen-model = { path = "crates/lumen-model", version = "0.0.1" }
+
+# External — keep minimal (see CLAUDE.md §5)
+thiserror = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
+debug = true

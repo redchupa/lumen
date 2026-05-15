@@ -1,0 +1,37 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Lumen
+/models/
+/bench-results/
+*.gguf
+*.bin
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+
+# Profiling
+perf.data*
+*.perf
+flamegraph.svg

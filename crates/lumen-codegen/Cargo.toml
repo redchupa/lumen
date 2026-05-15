@@ -1,0 +1,17 @@
+[package]
+name = "lumen-codegen"
+description = "Lumen codegen — x86_64 (AVX2/AVX-512), ARM64 (NEON), CUDA"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+cuda = []
+
+[dependencies]
+lumen-ir.workspace = true
+thiserror.workspace = true

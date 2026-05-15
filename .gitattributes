@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+*.rs       text diff=rust
+*.lum      text
+*.toml     text
+*.md       text
+*.yml      text
+*.yaml     text
+
+*.bin      binary
+*.gguf     binary
+*.png      binary
+*.jpg      binary
