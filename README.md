@@ -31,16 +31,46 @@ PyTorch나 ONNX Runtime처럼 기성 그래프 컴파일러를 갖다 쓰는 것
 
 | Phase | 산출물 | 상태 |
 |---|---|---|
-| 0. 설계 | 아키텍처 문서, 워크스페이스 | 🚧 진행 중 |
-| 1. DSL · 파서 | Pratt 파서, AST, 타입 | ⏳ |
-| 2. IR · 코드 생성 | x86_64/ARM64, matmul | ⏳ |
-| 3. SIMD 최적화 | AVX2/NEON, 90% peak GEMM | ⏳ |
+| 0. 설계 | 아키텍처 문서, 워크스페이스 | ✅ 완료 |
+| 1. DSL · 파서 | Pratt 파서, AST, 타입 검사, 진단 | ✅ 완료 (21 tests) |
+| 2. IR · 코드 생성 | x86_64/ARM64, matmul | 🚧 진행 중 |
+| 3. SIMD 최적화 | AVX2/NEON, ggml 80~95% GEMM | ⏳ |
 | 4. JIT 엔진 | 런타임 컴파일 | ⏳ |
 | 5. 양자화 | INT8/INT4, GGUF | ⏳ |
 | 6. LLM 추론 | 토크나이저, KV, sampling | ⏳ |
 | 7. 벤치 · 블로그 | vs llama.cpp | ⏳ |
 
 상세 계획: [PLAN.md](./PLAN.md) · 아키텍처: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
+
+## Quick start
+
+```sh
+git clone https://github.com/redchupa/lumen
+cd lumen
+cargo build --workspace
+
+# Parse a Lumen source file and dump its AST.
+cargo run -p lumen-cli -- parse examples/matmul.lum
+
+# Type-check it.
+cargo run -p lumen-cli -- check examples/matmul.lum
+# ok: examples/matmul.lum type-checked
+```
+
+`examples/matmul.lum`:
+
+```rust
+fn matmul(
+    a: tensor<f32, [64, 128]>,
+    b: tensor<f32, [128, 32]>,
+) -> tensor<f32, [64, 32]> {
+    return a @ b;
+}
+```
+
+The type checker enforces `a.shape[1] == b.shape[0]` and infers the result
+shape `[a.shape[0], b.shape[1]]` at compile time. Try changing `128` to `127`
+in either tensor — you get a typed error pointing at the exact source span.
 
 ## Non-goals
 

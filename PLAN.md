@@ -56,14 +56,15 @@
 - [ ] CI 골격 (cargo test, fmt, clippy)
 - **검증**: `cargo build` 통과, 빈 워크스페이스 컴파일 성공
 
-### Phase 1 — DSL · 파서 (3주)
+### Phase 1 — DSL · 파서 (완료, 1일)
 
-- [ ] 렉서 (zero-copy, span 보존)
-- [ ] Pratt 파서
-- [ ] AST + visitor
-- [ ] 타입 시스템 (텐서 형상이 타입의 일부)
-- [ ] 진단(diagnostic) 출력 (codespan 스타일)
-- **검증**: `examples/matmul.lum` 파싱 → AST 덤프 성공
+- [x] 렉서 (zero-copy, span 보존, 한글 식별자 지원)
+- [x] Pratt 파서 (matmul `@` > `*` `/` > `+` `-`, 단항 음수)
+- [x] AST (Module, Function, Type, Block, Stmt, Expr — 모두 span 보유)
+- [x] 타입 시스템 (텐서 형상이 타입의 일부, matmul 추론, dtype 일치 검증)
+- [x] 진단 출력 (codespan 스타일: `--> file:L:C`, gutter, underline)
+- [x] CLI `lumen parse` / `lumen check`
+- **검증**: `examples/matmul.lum` 파싱·타입검사 성공, 21개 단위 테스트 통과
 
 ### Phase 2 — IR · 코드 생성 (6주)
 

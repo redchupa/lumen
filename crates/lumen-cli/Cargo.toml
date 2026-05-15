@@ -19,3 +19,6 @@ lumen-codegen.workspace = true
 lumen-jit.workspace = true
 lumen-runtime.workspace = true
 lumen-model.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

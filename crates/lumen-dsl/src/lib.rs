@@ -3,8 +3,6 @@
 //! Pipeline: `source: &str` → [`lexer::Lexer`] → [`parser::Parser`] → [`ast::Module`]
 //! → [`typeck::TypeChecker`] → typed [`ast::Module`].
 
-#![allow(dead_code)] // Phase 0 scaffolding; remove once consumers exist.
-
 pub mod ast;
 pub mod diagnostic;
 pub mod lexer;
@@ -13,13 +11,14 @@ pub mod span;
 pub mod typeck;
 
 pub use ast::Module;
-pub use diagnostic::Diagnostic;
+pub use diagnostic::{render_all, Diagnostic};
+pub use parser::Parser;
 pub use span::Span;
+pub use typeck::TypeChecker;
 
-/// Convenience: source → typed module, collecting diagnostics.
-pub fn compile(_source: &str) -> Result<Module, Vec<Diagnostic>> {
-    // Phase 1 will wire lexer → parser → typeck here.
-    Err(vec![Diagnostic::todo(
-        "lumen-dsl::compile not implemented yet",
-    )])
+/// Convenience: lex → parse → type-check.
+pub fn compile(source: &str) -> Result<Module, Vec<Diagnostic>> {
+    let module = Parser::parse(source)?;
+    TypeChecker::check(&module)?;
+    Ok(module)
 }
