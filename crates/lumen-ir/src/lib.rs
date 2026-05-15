@@ -5,12 +5,12 @@
 
 #![allow(dead_code)] // Phase 0 scaffolding.
 
+pub mod lower;
 pub mod module;
 pub mod op;
-pub mod ty;
 pub mod pass;
-pub mod lower;
+pub mod ty;
 
-pub use module::{IrModule, Function, Block, Value, ValueId};
+pub use module::{Block, Function, IrModule, Value, ValueId};
 pub use op::Op;
-pub use ty::{TensorType, DType, Shape, Dim};
+pub use ty::{DType, Dim, Shape, TensorType};

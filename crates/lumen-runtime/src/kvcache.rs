@@ -9,6 +9,11 @@ pub struct KvCache {
 
 impl KvCache {
     pub fn new(layers: u32, max_tokens: u32, kv_heads: u32, head_dim: u32) -> Self {
-        Self { layers, max_tokens, head_dim, kv_heads }
+        Self {
+            layers,
+            max_tokens,
+            head_dim,
+            kv_heads,
+        }
     }
 }

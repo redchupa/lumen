@@ -31,7 +31,10 @@ pub struct Param {
 pub enum Type {
     Scalar(ScalarType),
     /// Tensor with element type and (possibly dynamic) shape.
-    Tensor { elem: ScalarType, shape: Shape },
+    Tensor {
+        elem: ScalarType,
+        shape: Shape,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -69,8 +72,15 @@ pub enum Expr {
     Ident(String),
     IntLit(i64),
     FloatLit(f64),
-    BinOp { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Call { callee: String, args: Vec<Expr> },
+    BinOp {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Call {
+        callee: String,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Copy, Clone, Debug)]

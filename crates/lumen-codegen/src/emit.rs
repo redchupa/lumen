@@ -35,6 +35,10 @@ impl Emitter {
         self.buf.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     pub fn patch_u32(&mut self, offset: usize, value: u32) {
         self.buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }

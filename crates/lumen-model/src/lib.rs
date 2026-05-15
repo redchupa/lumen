@@ -5,9 +5,9 @@
 
 #![allow(dead_code)] // Phase 0 scaffolding.
 
+pub mod arch;
 pub mod gguf;
 pub mod tokenizer;
-pub mod arch;
 
 pub use gguf::GgufFile;
 pub use tokenizer::Tokenizer;

@@ -41,7 +41,11 @@ impl Function {
     pub fn push(&mut self, value: Value) -> ValueId {
         let id = ValueId(self.values.len() as u32);
         self.values.push(value);
-        self.blocks.last_mut().expect("at least one block").values.push(id);
+        self.blocks
+            .last_mut()
+            .expect("at least one block")
+            .values
+            .push(id);
         id
     }
 }

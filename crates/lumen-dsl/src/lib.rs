@@ -19,5 +19,7 @@ pub use span::Span;
 /// Convenience: source → typed module, collecting diagnostics.
 pub fn compile(_source: &str) -> Result<Module, Vec<Diagnostic>> {
     // Phase 1 will wire lexer → parser → typeck here.
-    Err(vec![Diagnostic::todo("lumen-dsl::compile not implemented yet")])
+    Err(vec![Diagnostic::todo(
+        "lumen-dsl::compile not implemented yet",
+    )])
 }

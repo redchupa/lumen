@@ -7,6 +7,8 @@ pub struct TypeChecker;
 
 impl TypeChecker {
     pub fn check(_module: &mut Module) -> Result<(), Vec<Diagnostic>> {
-        Err(vec![Diagnostic::todo("TypeChecker::check not implemented yet")])
+        Err(vec![Diagnostic::todo(
+            "TypeChecker::check not implemented yet",
+        )])
     }
 }
