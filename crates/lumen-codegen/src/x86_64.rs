@@ -13,7 +13,8 @@
 //! Layout assumption: row-major, fp32, contiguous. Buffers are caller-owned.
 
 use crate::avx2_enc::{
-    vbroadcastss, vfmadd231ps_mem, vfmadd231ps_reg, vmovups_load, vmovups_store, vxorps_zero, Ymm,
+    vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm, vfmadd231ps_mem, vfmadd231ps_reg,
+    vmovd_load, vmovups_load, vmovups_store, vmulps_reg, vpmovsxbd_load, vxorps_zero, Ymm,
 };
 use crate::backend::{Backend, Capabilities, CodegenError, CodegenOpts, MachineCode};
 use crate::emit::Emitter;
@@ -108,9 +109,19 @@ impl Backend for X86_64 {
 // Function emission
 // ============================================================================
 
-/// Emit one function. Phase 2.B requires the body to be exactly
-/// `Param, Param, MatMul, Return` (in any order matching that shape).
+/// Emit one function. Two patterns supported:
+/// - matmul:    `Param, Param, MatMul, Return`           (Phase 2.B/3)
+/// - dequant:   `Param, Dequantize, Return`              (Phase 5.B, Q8_0 only)
 fn emit_function(em: &mut Emitter, f: &Function, abi: Abi, avx2: bool) -> Result<(), CodegenError> {
+    // Try dequantize pattern first: a single Dequantize op whose source is a Param.
+    if let Some(dq_idx) = f
+        .values
+        .iter()
+        .position(|v| matches!(v.op, Op::Dequantize { .. }))
+    {
+        return emit_function_dequant(em, f, dq_idx, abi);
+    }
+
     // Identify the matmul op and its two operand params.
     let mut matmul_idx: Option<usize> = None;
     let mut return_src: Option<ValueId> = None;
@@ -433,6 +444,138 @@ fn emit_matmul_avx2(
     pop_r64(em, Reg::RBX);
     pop_r64(em, Reg::R15);
     pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// Emit a Q8_0 dequantize function.
+///
+/// Source IR: `Param(q8_0, [N])` → `Dequantize` → `Return`.
+///
+/// Input pointer (`p0`) addresses the start of `block_q8_0` blocks (18 bytes
+/// per block: 2 bytes fp16 scale + ... wait, Q8_0 is 34 bytes: fp16 d + 32 i8).
+/// Output pointer (`p1`) is the destination fp32 buffer.
+///
+/// Generated pseudo-asm (per block):
+/// ```text
+///   ; Load fp16 d from [r12 + i*34 + 0], convert to fp32, broadcast.
+///   vmovd        xmm1, [r12 + i*34]
+///   vcvtph2ps    xmm1, xmm1
+///   vbroadcastss ymm0, xmm1
+///   ; For each of 4 groups of 8:
+///   vpmovsxbd    ymm1, [r12 + i*34 + 2 + g*8]   ; 8 i8 → 8 i32
+///   vcvtdq2ps    ymm1, ymm1                     ; 8 i32 → 8 f32
+///   vmulps       ymm1, ymm1, ymm0               ; * d
+///   vmovups      [r13 + i*128 + g*32], ymm1     ; store 8 f32
+/// ```
+fn emit_function_dequant(
+    em: &mut Emitter,
+    f: &Function,
+    dq_idx: usize,
+    abi: Abi,
+) -> Result<(), CodegenError> {
+    use lumen_ir::ty::DType;
+
+    let dq = &f.values[dq_idx];
+    let Op::Dequantize { x } = &dq.op else {
+        unreachable!()
+    };
+    let src_ty = &f.values[x.0 as usize].ty;
+    if src_ty.dtype != DType::Q8_0 {
+        return Err(CodegenError::UnsupportedOp(
+            "x86_64 Phase 5.B: only Q8_0 dequantize is supported".into(),
+        ));
+    }
+    if dq.ty.dtype != DType::F32 {
+        return Err(CodegenError::UnsupportedOp(
+            "Q8_0 dequant must produce f32 output".into(),
+        ));
+    }
+    // We require x = Param(0). Output buffer is implicit param 1.
+    let src_param = match &f.values[x.0 as usize].op {
+        Op::Param { index } => *index,
+        _ => {
+            return Err(CodegenError::UnsupportedOp(
+                "Phase 5.B: dequantize operand must be a Param".into(),
+            ));
+        }
+    };
+
+    // Total elements = product of shape dims.
+    let n_elems: u32 = src_ty
+        .shape
+        .0
+        .iter()
+        .map(|d| match d {
+            Dim::Static(v) => *v,
+            Dim::Dynamic(_) => 0,
+        })
+        .product();
+    if n_elems % 32 != 0 {
+        return Err(CodegenError::ShapeError(
+            "Q8_0 dequant requires element count divisible by 32".into(),
+        ));
+    }
+    let num_blocks = (n_elems / 32) as i32;
+
+    let p_src = abi.param_reg(src_param);
+    let p_dst = abi.param_reg(f.params.len() as u32);
+
+    emit_dequant_q8_body(em, p_src, p_dst, num_blocks, abi);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_dequant_q8_body(em: &mut Emitter, p_src: Reg, p_dst: Reg, num_blocks: i32, abi: Abi) {
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_src);
+    mov_rr(em, Reg::R13, p_dst);
+
+    // RBX = i (block index)
+    xor_rr(em, Reg::RBX);
+    let loop_start = em.len();
+    cmp_ri32(em, Reg::RBX, num_blocks);
+    let jge_end = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // RAX = i * 34 (block byte offset within source)
+    mov_rr(em, Reg::RAX, Reg::RBX);
+    imul_rri32(em, Reg::RAX, Reg::RAX, 34);
+
+    // ymm0 = broadcast(fp32(fp16 d at [R12 + RAX]))
+    vmovd_load(em, Ymm(1), Reg::R12, Some((Reg::RAX, Scale::S1)), 0);
+    vcvtph2ps_xmm(em, Ymm(1), Ymm(1));
+    vbroadcastss_xmm(em, Ymm(0), Ymm(1));
+
+    // RCX = i * 128 (dest byte offset = i * 32 * 4)
+    mov_rr(em, Reg::RCX, Reg::RBX);
+    imul_rri32(em, Reg::RCX, Reg::RCX, 128);
+
+    // 4 groups of 8 elements each.
+    for g in 0..4i32 {
+        let qs_offset = 2 + g * 8; // 2-byte d + g*8 i8s
+        vpmovsxbd_load(em, Ymm(1), Reg::R12, Some((Reg::RAX, Scale::S1)), qs_offset);
+        vcvtdq2ps(em, Ymm(1), Ymm(1));
+        vmulps_reg(em, Ymm(1), Ymm(1), Ymm(0));
+        vmovups_store(em, Ymm(1), Reg::R13, Some((Reg::RCX, Scale::S1)), g * 32);
+    }
+
+    inc_r(em, Reg::RBX);
+    let jmp_back = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_back, loop_start);
+
+    let end = em.len();
+    patch_rel32(em, jge_end, end);
+
+    // epilogue
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
     pop_r64(em, Reg::R13);
     pop_r64(em, Reg::R12);
     ret(em);

@@ -255,6 +255,114 @@ pub fn vaddps_reg(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
     em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
 }
 
+/// `vmovd xmm, [base + index*scale + disp32]` — load 4 bytes into the low
+/// lane of an XMM register. Used to bring a 16-bit fp16 (lower half) into the
+/// FPU register file for subsequent `vcvtph2ps`.
+///
+/// Encoding: VEX.128.66.0F.W0 6E /r
+pub fn vmovd_load(em: &mut Emitter, dst: Ymm, base: Reg, index: Option<(Reg, Scale)>, disp: i32) {
+    let x = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    emit_vex(
+        em,
+        dst.high1(),
+        x,
+        base.high1(),
+        OpcodeMap::M0F,
+        0,
+        0,
+        0, // L=0 → 128-bit
+        Prefix::P66,
+    );
+    em.u8(0x6E);
+    emit_modrm_sib_disp32(em, dst.low3(), base, index, disp);
+}
+
+/// `vcvtph2ps xmm_dst, xmm_src` — convert the lower 4 fp16 lanes of `src` to
+/// 4 fp32 lanes of `dst` (xmm form).
+///
+/// Encoding: VEX.128.66.0F38.W0 13 /r
+pub fn vcvtph2ps_xmm(em: &mut Emitter, dst: Ymm, src: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src.high1(),
+        OpcodeMap::M0F38,
+        0,
+        0,
+        0, // L=0
+        Prefix::P66,
+    );
+    em.u8(0x13);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src.low3());
+}
+
+/// `vpmovsxbd ymm, [base + index*scale + disp32]` — sign-extend 8 i8 values
+/// from memory into 8 i32 lanes of `dst`.
+///
+/// Encoding: VEX.256.66.0F38.W0 21 /r
+pub fn vpmovsxbd_load(
+    em: &mut Emitter,
+    dst: Ymm,
+    base: Reg,
+    index: Option<(Reg, Scale)>,
+    disp: i32,
+) {
+    let x = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    emit_vex(
+        em,
+        dst.high1(),
+        x,
+        base.high1(),
+        OpcodeMap::M0F38,
+        0,
+        0,
+        1, // L=1 → 256-bit
+        Prefix::P66,
+    );
+    em.u8(0x21);
+    emit_modrm_sib_disp32(em, dst.low3(), base, index, disp);
+}
+
+/// `vcvtdq2ps ymm_dst, ymm_src` — convert 8 i32 lanes to 8 fp32 lanes.
+///
+/// Encoding: VEX.256.0F.WIG 5B /r
+pub fn vcvtdq2ps(em: &mut Emitter, dst: Ymm, src: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src.high1(),
+        OpcodeMap::M0F,
+        0,
+        0,
+        1,
+        Prefix::None,
+    );
+    em.u8(0x5B);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src.low3());
+}
+
+/// `vbroadcastss ymm_dst, xmm_src` — broadcast the lowest fp32 lane of `src`
+/// to all 8 lanes of `dst`.
+///
+/// Encoding: VEX.256.66.0F38.W0 18 /r  (ModR/M.mod = 11, register form)
+pub fn vbroadcastss_xmm(em: &mut Emitter, dst: Ymm, src: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src.high1(),
+        OpcodeMap::M0F38,
+        0,
+        0,
+        1,
+        Prefix::P66,
+    );
+    em.u8(0x18);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src.low3());
+}
+
 // ---- shared ModR/M+SIB+disp32 emission ----------------------------------
 
 fn emit_modrm_sib_disp32(
@@ -337,5 +445,40 @@ mod tests {
             enc(|e| vfmadd231ps_mem(e, Ymm(2), Ymm(0), Reg::R13, Some((Reg::RAX, Scale::S4)), 0));
         assert_eq!(bytes[0], 0xC4); // 3-byte VEX
         assert!(bytes.contains(&0xB8));
+    }
+
+    #[test]
+    fn encodes_vcvtph2ps_xmm() {
+        let bytes = enc(|e| vcvtph2ps_xmm(e, Ymm(0), Ymm(0)));
+        assert_eq!(bytes[0], 0xC4); // 3-byte VEX (0F 38 map)
+        assert!(bytes.contains(&0x13));
+    }
+
+    #[test]
+    fn encodes_vpmovsxbd_load() {
+        let bytes = enc(|e| vpmovsxbd_load(e, Ymm(1), Reg::RDX, None, 0));
+        assert_eq!(bytes[0], 0xC4);
+        assert!(bytes.contains(&0x21));
+    }
+
+    #[test]
+    fn encodes_vcvtdq2ps() {
+        let bytes = enc(|e| vcvtdq2ps(e, Ymm(1), Ymm(1)));
+        assert!(bytes.contains(&0x5B));
+    }
+
+    #[test]
+    fn encodes_vmovd_load() {
+        let bytes = enc(|e| vmovd_load(e, Ymm(0), Reg::RCX, None, 0));
+        assert!(bytes.contains(&0x6E));
+    }
+
+    #[test]
+    fn encodes_vbroadcastss_xmm_to_ymm() {
+        let bytes = enc(|e| vbroadcastss_xmm(e, Ymm(0), Ymm(0)));
+        assert_eq!(bytes[0], 0xC4);
+        assert!(bytes.contains(&0x18));
+        // last byte is ModR/M with mod=11
+        assert!(bytes[bytes.len() - 1] & 0b1100_0000 == 0b1100_0000);
     }
 }
