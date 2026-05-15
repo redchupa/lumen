@@ -77,13 +77,18 @@
 - [x] CLI: `lumen ir`, `lumen compile-c`
 - [x] e2e 정답성: 8×8, 4×5×3 matmul = naive Rust reference (1e-4 허용)
 
-**Phase 2.B (다음)**: 자체 native backend
-- [ ] 코드 생성기 백엔드 트레이트 인스턴스화 (x86_64, ARM64)
-- [ ] x86_64 (스칼라 명령어부터, System V + Windows x64 ABI)
-- [ ] ARM64 (스칼라 명령어부터, AAPCS64)
-- [ ] e2e 정답성: 자체 backend 결과 ≡ C backend 결과 ≡ Rust reference
+**Phase 2.B (완료, x86_64만)**: 자체 native backend
+- [x] 코드 생성기 백엔드 트레이트 인스턴스화 (x86_64)
+- [x] x86_64 명령어 인코더 (REX, ModR/M, SIB, displacement, rel32 patch)
+- [x] x86_64 backend (스칼라 mulss/addss, System V + Windows x64 ABI 두 코드 경로)
+- [x] JIT exec region (VirtualAlloc/mmap + W^X)
+- [x] e2e 정답성: 자체 backend 결과 ≡ naive Rust (3 케이스: 4×4, 8×8, 4×5×3)
+- [x] 단위 테스트: 9개 인코더 + 3개 e2e
 
-검증: Phase 2.A 완료 후 Phase 2.B의 첫 milestone은 "x86_64 emit한 함수가 dylib로 동작"
+**Phase 2.C (다음)**: ARM64
+- [ ] ARM64 명령어 인코더 (24-bit branch imm, LDR/STR scaled offset)
+- [ ] ARM64 backend (스칼라 fmul/fmadd, AAPCS64 ABI)
+- [ ] e2e: ARM64 결과 ≡ x86_64 결과 ≡ naive Rust
 
 ### Phase 3 — SIMD 최적화 (4주)
 

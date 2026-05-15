@@ -12,6 +12,7 @@ pub mod c;
 pub mod cuda;
 pub mod emit;
 pub mod x86_64;
+pub mod x86_64_enc;
 
 pub use backend::{Backend, Capabilities, CodegenOpts, MachineCode};
 pub use c::{emit_module as emit_c, CBackendError};

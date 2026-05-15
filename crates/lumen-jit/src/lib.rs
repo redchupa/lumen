@@ -11,3 +11,4 @@ pub mod cache;
 pub mod exec;
 
 pub use cache::CodeCache;
+pub use exec::{ExecError, ExecRegion};
