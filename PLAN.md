@@ -66,15 +66,24 @@
 - [x] CLI `lumen parse` / `lumen check`
 - **검증**: `examples/matmul.lum` 파싱·타입검사 성공, 21개 단위 테스트 통과
 
-### Phase 2 — IR · 코드 생성 (6주)
+### Phase 2 — IR · 코드 생성 (단계 분할)
 
-- [ ] SSA IR 정의 (Op, Value, Block)
-- [ ] AST → IR 로어링
-- [ ] 코드 생성기 백엔드 트레이트
-- [ ] x86_64 (스칼라부터)
-- [ ] ARM64 (스칼라부터)
-- [ ] matmul 정답성 테스트 (vs ndarray)
-- **검증**: 8x8x8 fp32 matmul 정답성, 단위 테스트 통과
+**Phase 2.A (완료)**: IR + C backend (reference oracle)
+- [x] SSA IR 정의 (Op, Value, Block, Function with `param_values`)
+- [x] AST → IR 로어링 (matmul, params, return; let/scalar는 차후)
+- [x] IR Printer (LLVM/MLIR 스타일 텍스트 덤프)
+- [x] IR Verifier (use-before-def, matmul shape/dtype, return type)
+- [x] C99 백엔드 (matmul 패턴, naive triple-loop)
+- [x] CLI: `lumen ir`, `lumen compile-c`
+- [x] e2e 정답성: 8×8, 4×5×3 matmul = naive Rust reference (1e-4 허용)
+
+**Phase 2.B (다음)**: 자체 native backend
+- [ ] 코드 생성기 백엔드 트레이트 인스턴스화 (x86_64, ARM64)
+- [ ] x86_64 (스칼라 명령어부터, System V + Windows x64 ABI)
+- [ ] ARM64 (스칼라 명령어부터, AAPCS64)
+- [ ] e2e 정답성: 자체 backend 결과 ≡ C backend 결과 ≡ Rust reference
+
+검증: Phase 2.A 완료 후 Phase 2.B의 첫 milestone은 "x86_64 emit한 함수가 dylib로 동작"
 
 ### Phase 3 — SIMD 최적화 (4주)
 

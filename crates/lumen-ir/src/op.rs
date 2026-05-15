@@ -6,6 +6,13 @@ use crate::module::ValueId;
 
 #[derive(Clone, Debug)]
 pub enum Op {
+    // -- Function I/O --
+    /// `param i` — i-th function parameter. Result type taken from the
+    /// owning function's signature.
+    Param {
+        index: u32,
+    },
+
     // -- Memory / constants --
     LoadWeight {
         name: String,

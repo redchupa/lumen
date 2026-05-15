@@ -7,9 +7,11 @@
 
 pub mod arm64;
 pub mod backend;
+pub mod c;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod emit;
 pub mod x86_64;
 
 pub use backend::{Backend, Capabilities, CodegenOpts, MachineCode};
+pub use c::{emit_module as emit_c, CBackendError};

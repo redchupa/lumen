@@ -15,3 +15,8 @@ cuda = []
 [dependencies]
 lumen-ir.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+lumen-dsl.workspace = true
+libloading = "0.8"
+tempfile = "3"

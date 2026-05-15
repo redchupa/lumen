@@ -25,17 +25,32 @@ pub struct Function {
     pub ret: TensorType,
     pub values: Vec<Value>,
     pub blocks: Vec<Block>,
+    /// Result IDs of the synthetic `Op::Param { index: i }` values prepended
+    /// to `values`. Same order as `params`.
+    pub param_values: Vec<ValueId>,
 }
 
 impl Function {
+    /// Create a new function with a single empty entry block. Each parameter is
+    /// represented by a synthetic `Op::Param { index }` value pushed into the
+    /// entry block, so callers can reference parameters by [`ValueId`].
     pub fn new(name: impl Into<String>, params: Vec<TensorType>, ret: TensorType) -> Self {
-        Self {
+        let mut f = Self {
             name: name.into(),
-            params,
+            params: params.clone(),
             ret,
             values: Vec::new(),
             blocks: vec![Block::default()],
+            param_values: Vec::with_capacity(params.len()),
+        };
+        for (i, pty) in params.into_iter().enumerate() {
+            let id = f.push(Value {
+                op: Op::Param { index: i as u32 },
+                ty: pty,
+            });
+            f.param_values.push(id);
         }
+        f
     }
 
     pub fn push(&mut self, value: Value) -> ValueId {
@@ -47,6 +62,14 @@ impl Function {
             .values
             .push(id);
         id
+    }
+
+    pub fn value(&self, id: ValueId) -> &Value {
+        &self.values[id.0 as usize]
+    }
+
+    pub fn type_of(&self, id: ValueId) -> &TensorType {
+        &self.values[id.0 as usize].ty
     }
 }
 
