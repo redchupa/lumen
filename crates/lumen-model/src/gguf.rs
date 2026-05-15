@@ -190,6 +190,10 @@ pub enum GgufError {
     BadString(usize),
     #[error("tensor `{0}` not found")]
     NoSuchTensor(String),
+    #[error("metadata key `{0}` not found")]
+    NoSuchKey(String),
+    #[error("metadata key `{key}` has wrong type (expected {expected:?}, got something else)")]
+    WrongKvKind { key: String, expected: KvType },
 }
 
 /// A parsed GGUF file.
@@ -294,6 +298,59 @@ impl GgufFile {
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
         self.tensor_by_name.get(name).map(|&i| &self.tensors[i])
+    }
+
+    /// Decode an `Array(String)` metadata value back into a `Vec<String>`.
+    ///
+    /// GGUF stores arrays of strings as `n × (u64 length, bytes)` packed in the
+    /// raw payload that [`KvValue::Array`] carries. This helper walks that
+    /// payload — `O(n)` and allocates one `String` per element.
+    pub fn metadata_string_array(&self, key: &str) -> Result<Vec<String>, GgufError> {
+        let v = self
+            .metadata
+            .get(key)
+            .ok_or_else(|| GgufError::NoSuchKey(key.to_string()))?;
+        let (elem_t, raw) = match v {
+            KvValue::Array(t, raw) => (*t, raw),
+            _ => {
+                return Err(GgufError::WrongKvKind {
+                    key: key.to_string(),
+                    expected: KvType::Array,
+                })
+            }
+        };
+        if elem_t != KvType::String {
+            return Err(GgufError::WrongKvKind {
+                key: key.to_string(),
+                expected: KvType::String,
+            });
+        }
+        let mut out = Vec::new();
+        let mut p = 0usize;
+        while p < raw.len() {
+            if p + 8 > raw.len() {
+                return Err(GgufError::Truncated {
+                    needed: 8,
+                    at: p,
+                    available: raw.len() - p,
+                });
+            }
+            let len = u64::from_le_bytes(raw[p..p + 8].try_into().unwrap()) as usize;
+            p += 8;
+            if p + len > raw.len() {
+                return Err(GgufError::Truncated {
+                    needed: len,
+                    at: p,
+                    available: raw.len() - p,
+                });
+            }
+            let s = std::str::from_utf8(&raw[p..p + len])
+                .map_err(|_| GgufError::BadString(p))?
+                .to_string();
+            p += len;
+            out.push(s);
+        }
+        Ok(out)
     }
 
     /// Borrow the raw bytes of one tensor. Length matches `info.byte_size()`.

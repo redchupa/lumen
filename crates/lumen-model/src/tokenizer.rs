@@ -31,6 +31,8 @@
 
 use std::collections::HashMap;
 
+use crate::gguf::{GgufError, GgufFile};
+
 #[derive(thiserror::Error, Debug)]
 pub enum TokError {
     #[error("token id {0} is out of range (vocab size {1})")]
@@ -49,6 +51,7 @@ impl TokenBytes {
     }
 }
 
+#[derive(Debug)]
 pub struct Tokenizer {
     /// Token id → bytes.
     id_to_bytes: Vec<TokenBytes>,
@@ -151,6 +154,45 @@ impl Tokenizer {
     /// Borrow the bytes of one token (useful for logging / debugging).
     pub fn token_bytes(&self, id: u32) -> Option<&[u8]> {
         self.id_to_bytes.get(id as usize).map(|t| t.0.as_slice())
+    }
+
+    /// Build a tokenizer from a parsed GGUF file.
+    ///
+    /// Reads `tokenizer.ggml.tokens` (required) and `tokenizer.ggml.merges`
+    /// (optional — empty if absent, e.g. for unigram tokenizers). Each merge
+    /// string is split on the first space into `(left, right)`. Token bytes
+    /// are taken verbatim from the GGUF strings, so callers that need to
+    /// reverse Qwen/GPT-2's byte-to-unicode pre-mapping should do that step
+    /// upstream (Phase 6.C concern, not 6.B).
+    pub fn from_gguf(file: &GgufFile) -> Result<Self, GgufError> {
+        let tokens = file.metadata_string_array("tokenizer.ggml.tokens")?;
+        let vocab: Vec<TokenBytes> = tokens
+            .into_iter()
+            .map(|s| TokenBytes(s.into_bytes()))
+            .collect();
+
+        // Merges are optional. If the key is missing we treat it as no merges.
+        let merge_strs = match file.metadata_string_array("tokenizer.ggml.merges") {
+            Ok(v) => v,
+            Err(GgufError::NoSuchKey(_)) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+
+        let merges = merge_strs
+            .into_iter()
+            .filter_map(|s| {
+                // Each merge is "<left> <right>". The split is on the *first*
+                // space; the rest belongs to the right side (Qwen merges may
+                // contain spaces inside the right token's byte mapping).
+                let bytes = s.into_bytes();
+                let sep = bytes.iter().position(|&b| b == b' ')?;
+                let left = TokenBytes(bytes[..sep].to_vec());
+                let right = TokenBytes(bytes[sep + 1..].to_vec());
+                Some((left, right))
+            })
+            .collect();
+
+        Ok(Self::new(vocab, merges))
     }
 }
 
