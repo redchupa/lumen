@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use lumen_jit::MatmulJitCache;
 use lumen_model::tokenizer::{BpeMode, Tokenizer};
 use lumen_model::{config_from_gguf, model_from_gguf, GgmlType, GgufFile};
 
@@ -196,4 +197,115 @@ fn qwen_generates_first_korean_tokens() {
     }
 
     assert_eq!(new_ids.len(), max_new);
+}
+
+/// Naive Rust `weight_matmul(a, w, 1, K, N)`: 1×K activation × w^T where
+/// `w` is stored row-major as `[N, K]` (ggml convention).
+fn naive_weight_matmul(a: &[f32], w: &[f32], k_dim: usize, n_dim: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n_dim];
+    for n in 0..n_dim {
+        let mut acc = 0.0f32;
+        for k in 0..k_dim {
+            acc += a[k] * w[n * k_dim + k];
+        }
+        out[n] = acc;
+    }
+    out
+}
+
+/// Transpose a `[N, K]` row-major matrix into `[K, N]` row-major.
+/// (i.e. `out[k * N + n] = src[n * K + k]`)
+fn transpose_n_k_to_k_n(src: &[f32], n: usize, k: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n * k];
+    for ni in 0..n {
+        for ki in 0..k {
+            out[ki * n + ni] = src[ni * k + ki];
+        }
+    }
+    out
+}
+
+/// Phase 6.G.2 demo: run Qwen's lm_head (M=1, K=896, N=151936) through
+/// (a) the in-tree naive matmul and (b) the Phase 6.G.1 JIT cache after
+/// transposing the weight to row-major `[K, N]`. Verify the results agree
+/// elementwise, then print both wall-clock times so the speedup is visible.
+#[test]
+#[ignore = "loads ~640MB and runs lm_head twice; run with --ignored --nocapture"]
+fn qwen_lm_head_jit_matches_naive_and_is_faster() {
+    if !check_qwen_present() {
+        eprintln!("skip: {} not present", QWEN_PATH);
+        return;
+    }
+    let file = GgufFile::open(QWEN_PATH).expect("open gguf");
+    let model = model_from_gguf(&file, "qwen2").expect("model");
+
+    let hidden = model.config.hidden(); // 896
+    let vocab = model.config.vocab_size; // 151936
+    assert_eq!(vocab % 8, 0, "JIT path requires N % 8 == 0");
+
+    // A representative activation row (we don't need a meaningful one — this
+    // is a numerical equivalence check, not a generation step).
+    let activation: Vec<f32> = (0..hidden)
+        .map(|i| ((i % 37) as f32) * 0.001 - 0.02)
+        .collect();
+
+    // --- naive ---
+    let t_naive = std::time::Instant::now();
+    let naive_logits = naive_weight_matmul(&activation, &model.lm_head_w, hidden, vocab);
+    let naive_elapsed = t_naive.elapsed();
+    eprintln!("lm_head naive : {:>10?}", naive_elapsed);
+
+    // --- prepare JIT: transpose lm_head from [vocab, hidden] to [hidden, vocab] ---
+    let t_prep = std::time::Instant::now();
+    let lm_head_t = transpose_n_k_to_k_n(&model.lm_head_w, vocab, hidden);
+    let prep_elapsed = t_prep.elapsed();
+    eprintln!("lm_head transp: {:>10?}  (one-time cost)", prep_elapsed);
+
+    let mut cache = MatmulJitCache::new();
+    let t_compile = std::time::Instant::now();
+    let f = cache
+        .get_or_compile(1, hidden as u32, vocab as u32)
+        .expect("jit compile");
+    let compile_elapsed = t_compile.elapsed();
+    eprintln!("lm_head compil: {:>10?}  (one-time cost)", compile_elapsed);
+
+    // --- JIT call ---
+    let mut jit_logits = vec![0.0f32; vocab];
+    let t_jit = std::time::Instant::now();
+    // SAFETY: we just compiled for (1, hidden, vocab); the buffer sizes match.
+    unsafe {
+        f(
+            activation.as_ptr(),
+            lm_head_t.as_ptr(),
+            jit_logits.as_mut_ptr(),
+        );
+    }
+    let jit_elapsed = t_jit.elapsed();
+    eprintln!("lm_head JIT   : {:>10?}", jit_elapsed);
+
+    let speedup = naive_elapsed.as_secs_f64() / jit_elapsed.as_secs_f64();
+    eprintln!(
+        "speedup       : {:.1}x (JIT vs naive, single matmul)",
+        speedup
+    );
+
+    // --- correctness: every logit should agree within fp accumulation noise ---
+    let mut max_abs_diff = 0.0f32;
+    for (g, w) in jit_logits.iter().zip(naive_logits.iter()) {
+        let d = (g - w).abs();
+        if d > max_abs_diff {
+            max_abs_diff = d;
+        }
+    }
+    eprintln!(
+        "max |jit - naive| over {} logits: {:.2e}",
+        vocab, max_abs_diff
+    );
+    // Tolerance scales with K (896 fused multiply-adds). 1e-2 is loose enough
+    // to absorb the difference in summation order between the two paths.
+    assert!(
+        max_abs_diff < 1e-2,
+        "lm_head JIT vs naive diverged by {}",
+        max_abs_diff
+    );
 }

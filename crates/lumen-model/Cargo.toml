@@ -12,3 +12,6 @@ authors.workspace = true
 lumen-ir.workspace = true
 lumen-runtime.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+lumen-jit.workspace = true
