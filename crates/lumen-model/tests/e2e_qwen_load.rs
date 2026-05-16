@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use lumen_model::tokenizer::{BpeMode, Tokenizer};
 use lumen_model::{config_from_gguf, model_from_gguf, GgmlType, GgufFile};
 
 const QWEN_PATH: &str = r"C:\Users\redchupa\Desktop\github_auto_development\lumen\models\qwen2.5-0.5b-instruct-q8_0.gguf";
@@ -85,5 +86,49 @@ fn qwen_2_5_0_5b_model_loads_with_biases() {
         "Qwen2.5-0.5B loaded: {} layers, {} fp32 elements in token_embd",
         model.layers.len(),
         model.token_embeddings.len()
+    );
+}
+
+/// Build the Qwen tokenizer from the real GGUF and round-trip simple inputs.
+/// Phase 6.F.2.c milestone: byte mapping + BPE merges actually re-form the
+/// input string when decoded.
+#[test]
+fn qwen_tokenizer_round_trips_ascii_and_korean() {
+    if !check_qwen_present() {
+        eprintln!("skip: {} not present", QWEN_PATH);
+        return;
+    }
+    let file = GgufFile::open(QWEN_PATH).expect("open gguf");
+    let tok = Tokenizer::from_gguf(&file).expect("tokenizer");
+    assert_eq!(tok.mode(), BpeMode::Gpt2);
+    assert!(tok.vocab_size() >= 151_000);
+
+    // ASCII round-trip: must produce a non-empty id sequence and decode back
+    // to the same string.
+    let s = "hello";
+    let ids = tok.encode(s);
+    assert!(!ids.is_empty(), "encode produced no ids for {:?}", s);
+    let decoded = tok.decode(&ids).unwrap();
+    assert_eq!(
+        decoded, s,
+        "ASCII round-trip mismatch: {:?} -> {:?}",
+        s, decoded
+    );
+    eprintln!("encode({:?}) = {} tokens, decode round-trips", s, ids.len());
+
+    // Korean round-trip.
+    let k = "안녕";
+    let ids_k = tok.encode(k);
+    assert!(!ids_k.is_empty(), "encode produced no ids for {:?}", k);
+    let decoded_k = tok.decode(&ids_k).unwrap();
+    assert_eq!(
+        decoded_k, k,
+        "Korean round-trip mismatch: {:?} -> {:?}",
+        k, decoded_k
+    );
+    eprintln!(
+        "encode({:?}) = {} tokens, decode round-trips",
+        k,
+        ids_k.len()
     );
 }

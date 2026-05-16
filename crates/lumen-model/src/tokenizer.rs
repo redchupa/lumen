@@ -51,6 +51,59 @@ impl TokenBytes {
     }
 }
 
+/// The 256-element table mapping each raw byte to the Unicode character
+/// GPT-2 / Qwen2 / many other byte-level BPE tokenizers use in their vocab.
+///
+/// Construction matches the canonical algorithm in `bytes_to_unicode()` from
+/// huggingface/transformers (`tokenizers/src/decoders/byte_level.rs` mirrors
+/// it). Printable ASCII (33..=126) and the printable subset of Latin-1
+/// supplement map to themselves; the remaining 68 control / whitespace
+/// codepoints get mapped onto the U+0100..U+0143 range so every byte ends
+/// up as a single, distinct, printable character.
+pub fn gpt2_byte_to_unicode() -> [char; 256] {
+    let mut out = ['\0'; 256];
+    let direct: Vec<u8> = (33u8..=126u8)
+        .chain(161u8..=172u8)
+        .chain(174u8..=255u8)
+        .collect();
+    for &b in &direct {
+        out[b as usize] = b as char;
+    }
+    let mut next_codepoint: u32 = 0x100;
+    for b in 0u8..=255u8 {
+        if !direct.contains(&b) {
+            out[b as usize] = char::from_u32(next_codepoint).unwrap();
+            next_codepoint += 1;
+        }
+    }
+    out
+}
+
+/// Inverse of [`gpt2_byte_to_unicode`].
+pub fn gpt2_unicode_to_byte() -> HashMap<char, u8> {
+    let fwd = gpt2_byte_to_unicode();
+    let mut rev = HashMap::with_capacity(256);
+    for (i, &c) in fwd.iter().enumerate() {
+        rev.insert(c, i as u8);
+    }
+    rev
+}
+
+/// Pre-tokenization / decoding mode applied around the BPE algorithm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BpeMode {
+    /// Raw bytes — input UTF-8 bytes are matched against vocab bytes directly.
+    /// Useful for toy tokenizers; this is what Phase 6.A built.
+    Raw,
+    /// GPT-2 byte-level: each raw byte is mapped to a printable Unicode char
+    /// via [`gpt2_byte_to_unicode`], the resulting string's UTF-8 bytes are
+    /// fed to BPE, and decoding inverts the mapping back to raw bytes.
+    ///
+    /// Qwen2 / GPT-2 / Llama-2 (GGUF "gpt2") / many other modern tokenizers
+    /// use this scheme.
+    Gpt2,
+}
+
 #[derive(Debug)]
 pub struct Tokenizer {
     /// Token id → bytes.
@@ -59,6 +112,11 @@ pub struct Tokenizer {
     bytes_to_id: HashMap<TokenBytes, u32>,
     /// `(left_bytes, right_bytes) → rank`. Lower ranks merge first.
     merge_rank: HashMap<(TokenBytes, TokenBytes), u32>,
+    /// Active text-preprocessing mode (Raw or Gpt2).
+    mode: BpeMode,
+    /// Set when `mode == Gpt2`; nul-initialized otherwise.
+    byte_to_unicode: [char; 256],
+    unicode_to_byte: HashMap<char, u8>,
 }
 
 impl Tokenizer {
@@ -71,6 +129,14 @@ impl Tokenizer {
     ///
     /// Every byte 0..=255 must appear as a single-byte token in the vocab.
     pub fn new(vocab: Vec<TokenBytes>, merges: Vec<(TokenBytes, TokenBytes)>) -> Self {
+        Self::with_mode(vocab, merges, BpeMode::Raw)
+    }
+
+    pub fn with_mode(
+        vocab: Vec<TokenBytes>,
+        merges: Vec<(TokenBytes, TokenBytes)>,
+        mode: BpeMode,
+    ) -> Self {
         let mut bytes_to_id = HashMap::with_capacity(vocab.len());
         for (id, b) in vocab.iter().enumerate() {
             bytes_to_id.insert(b.clone(), id as u32);
@@ -83,7 +149,14 @@ impl Tokenizer {
             id_to_bytes: vocab,
             bytes_to_id,
             merge_rank,
+            mode,
+            byte_to_unicode: gpt2_byte_to_unicode(),
+            unicode_to_byte: gpt2_unicode_to_byte(),
         }
+    }
+
+    pub fn mode(&self) -> BpeMode {
+        self.mode
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -95,12 +168,31 @@ impl Tokenizer {
         if text.is_empty() {
             return Vec::new();
         }
-        // Start with every byte as its own token.
-        let mut tokens: Vec<TokenBytes> = text
-            .as_bytes()
-            .iter()
-            .map(|&b| TokenBytes(vec![b]))
-            .collect();
+        // Initial tokens. Each token's bytes must already exist in the vocab
+        // as a single entry — BPE only ever *merges* existing tokens.
+        //
+        //   Raw  : one TokenBytes per input byte (vocab is assumed to contain
+        //          every single-byte token at ids 0..=255).
+        //   Gpt2 : one TokenBytes per mapped char (vocab contains each of
+        //          the 256 byte-mapped chars as a single-token entry, where
+        //          the bytes inside that entry are the UTF-8 form of the
+        //          mapped char — 1 byte for printable ASCII, 2 bytes for the
+        //          remapped control / latin-1 codepoints).
+        let mut tokens: Vec<TokenBytes> = match self.mode {
+            BpeMode::Raw => text
+                .as_bytes()
+                .iter()
+                .map(|&b| TokenBytes(vec![b]))
+                .collect(),
+            BpeMode::Gpt2 => text
+                .as_bytes()
+                .iter()
+                .map(|&b| {
+                    let c = self.byte_to_unicode[b as usize];
+                    TokenBytes(c.to_string().into_bytes())
+                })
+                .collect(),
+        };
 
         // Iteratively merge the best (lowest-rank) adjacent pair until no
         // mergeable pair remains.
@@ -134,8 +226,26 @@ impl Tokenizer {
 
     /// Decode token ids back to a UTF-8 string.
     pub fn decode(&self, ids: &[u32]) -> Result<String, TokError> {
-        let bytes = self.decode_bytes(ids)?;
-        String::from_utf8(bytes).map_err(|e| TokError::BadUtf8(format!("{}", e)))
+        let token_bytes = self.decode_bytes(ids)?;
+        match self.mode {
+            BpeMode::Raw => {
+                String::from_utf8(token_bytes).map_err(|e| TokError::BadUtf8(format!("{}", e)))
+            }
+            BpeMode::Gpt2 => {
+                // token_bytes is the UTF-8 form of a byte-mapped string;
+                // walk its chars and invert each one back to its source byte.
+                let mapped = std::str::from_utf8(&token_bytes)
+                    .map_err(|e| TokError::BadUtf8(format!("{}", e)))?;
+                let mut raw = Vec::with_capacity(mapped.len());
+                for ch in mapped.chars() {
+                    let b = self.unicode_to_byte.get(&ch).ok_or_else(|| {
+                        TokError::BadUtf8(format!("unmapped char {:?} in decode", ch))
+                    })?;
+                    raw.push(*b);
+                }
+                String::from_utf8(raw).map_err(|e| TokError::BadUtf8(format!("{}", e)))
+            }
+        }
     }
 
     /// Decode token ids to raw bytes (no UTF-8 validation).
@@ -192,7 +302,14 @@ impl Tokenizer {
             })
             .collect();
 
-        Ok(Self::new(vocab, merges))
+        // Auto-detect mode from `tokenizer.ggml.model`. "gpt2" / "qwen2" etc.
+        // all use the byte-level mapping; anything else falls back to Raw.
+        let mode = match file.metadata().get("tokenizer.ggml.model") {
+            Some(crate::gguf::KvValue::String(s)) if s == "gpt2" => BpeMode::Gpt2,
+            _ => BpeMode::Raw,
+        };
+
+        Ok(Self::with_mode(vocab, merges, mode))
     }
 }
 
@@ -305,5 +422,59 @@ mod tests {
         let tok = Tokenizer::new(build_byte_vocab(&[]), vec![]);
         let err = tok.decode(&[9999]).unwrap_err();
         assert!(matches!(err, TokError::InvalidTokenId(9999, _)));
+    }
+
+    // ---- GPT-2 byte mapping tests -----------------------------------------
+
+    #[test]
+    fn gpt2_byte_to_unicode_has_known_anchors() {
+        let m = gpt2_byte_to_unicode();
+        // Space (0x20) is in the "needs remap" range, classic Ġ at U+0120.
+        assert_eq!(m[0x20], '\u{120}');
+        // Printable ASCII '!' (0x21) maps to itself.
+        assert_eq!(m[0x21], '!');
+        // Newline (0x0A) → U+010A (the 11th remapped codepoint).
+        assert_eq!(m[0x0A], '\u{10A}');
+        // Latin-1 'ÿ' (0xFF) maps to itself.
+        assert_eq!(m[0xFF], '\u{FF}');
+    }
+
+    #[test]
+    fn gpt2_mode_round_trips_ascii_with_correct_token_bytes() {
+        // GPT-2 vocab layout: each of the 256 byte-mapped chars is a single
+        // token at the start. For printable ASCII this is the same byte;
+        // for the remapped range it's the multi-byte UTF-8 of a U+01XX char.
+        let byte_unicode = gpt2_byte_to_unicode();
+        let mut vocab: Vec<TokenBytes> = byte_unicode
+            .iter()
+            .map(|&c| TokenBytes(c.to_string().into_bytes()))
+            .collect();
+        // Add merged "hi" — both 'h' and 'i' are printable ASCII so their
+        // mapped form equals themselves.
+        vocab.push(TokenBytes("hi".as_bytes().to_vec()));
+        let merges = vec![(TokenBytes(vec![b'h']), TokenBytes(vec![b'i']))];
+
+        let tok = Tokenizer::with_mode(vocab, merges, BpeMode::Gpt2);
+        let ids = tok.encode("hi");
+        assert_eq!(ids, vec![256]);
+        assert_eq!(tok.decode(&ids).unwrap(), "hi");
+    }
+
+    #[test]
+    fn gpt2_mode_handles_space_as_g_dot() {
+        // Build a GPT-2-style vocab where every byte-mapped char is one token.
+        let byte_unicode = gpt2_byte_to_unicode();
+        let vocab: Vec<TokenBytes> = byte_unicode
+            .iter()
+            .map(|&c| TokenBytes(c.to_string().into_bytes()))
+            .collect();
+        let tok = Tokenizer::with_mode(vocab, vec![], BpeMode::Gpt2);
+
+        // " " (0x20) maps to 'Ġ' (U+0120), the 33rd remapped codepoint, whose
+        // id is 32 + the count of bytes already mapped before it in the
+        // remap pass. We don't hard-code the id — just check the round-trip.
+        let ids = tok.encode(" ");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(tok.decode(&ids).unwrap(), " ");
     }
 }
