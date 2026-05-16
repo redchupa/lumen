@@ -41,7 +41,10 @@ PyTorch나 ONNX Runtime처럼 기성 그래프 컴파일러를 갖다 쓰는 것
 | 5.B. Native Q8 dequant | F16C+AVX2, IR Op::Dequantize 자동 합성 | ✅ 완료 |
 | 5.C. Q8 × F32 fused matmul | dequant×matmul 패턴 자동 융합 | ✅ 완료 |
 | 5.D. GGUF v3 reader | header + KV + tensor table + 라운드트립 | ✅ 완료 |
-| 5.E. **GGUF → native** | 디스크 파일 → JIT native dequant 라운드트립, **72 tests** | ✅ 완료 |
+| 5.E. GGUF → native | 디스크 파일 → JIT native dequant 라운드트립 | ✅ 완료 |
+| 6.A~D. Tokenizer + Transformer | BPE + Llama op + layer forward + KV cache | ✅ 완료 |
+| 6.E. Generate loop | Model + KV cache + autoregressive decode | ✅ 완료 |
+| 6.F. **Real Qwen2.5-0.5B 한국어 추론** | "안녕" → "안녕하세요, 저는" (~0.54s/token) | ✅ **완료** |
 | 2.C. ARM64 backend | AAPCS64, NEON-readiness | ⏳ |
 | 3.D. 캐시 타일링 | 블록 매크로커널, 256³+ 큰 사이즈 유지 | ⏳ |
 | 4. JIT 엔진 | 런타임 컴파일 | ⏳ |

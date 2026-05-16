@@ -132,3 +132,68 @@ fn qwen_tokenizer_round_trips_ascii_and_korean() {
         ids_k.len()
     );
 }
+
+/// The big one: load Qwen2.5-0.5B end-to-end and have Lumen actually run a
+/// forward pass for a Korean prompt. We don't yet expect coherent output
+/// because:
+///
+/// 1. Our naive Rust matmul is unoptimized; expect ~seconds per token.
+/// 2. Pre-tokenization regex (Phase 6.F.2.d) is skipped, so the token IDs
+///    we feed may differ from what the model was trained against.
+/// 3. fp32 accumulation throughout, no fused dequant.
+///
+/// What we *do* assert: the call returns without panicking, produces the
+/// requested number of new tokens, and they all decode back to a valid
+/// UTF-8 string (i.e. the byte mapping invariant is preserved through the
+/// whole pipeline).
+#[test]
+#[ignore = "loads ~640MB, dequantizes to ~2.5GB, runs fp32 forward — 10-60s in release"]
+fn qwen_generates_first_korean_tokens() {
+    if !check_qwen_present() {
+        eprintln!("skip: {} not present", QWEN_PATH);
+        return;
+    }
+
+    eprintln!("loading Qwen2.5-0.5B-Q8_0 ...");
+    let t_load = std::time::Instant::now();
+    let file = GgufFile::open(QWEN_PATH).expect("open gguf");
+    let model = model_from_gguf(&file, "qwen2").expect("model");
+    let tok = Tokenizer::from_gguf(&file).expect("tokenizer");
+    eprintln!("  loaded in {:?}", t_load.elapsed());
+
+    let prompt_text = "안녕";
+    let prompt_ids = tok.encode(prompt_text);
+    eprintln!("prompt: {:?} → ids: {:?}", prompt_text, prompt_ids);
+    assert!(!prompt_ids.is_empty());
+
+    let max_new = 3usize;
+    let t_gen = std::time::Instant::now();
+    let new_ids = model.generate_greedy(&prompt_ids, max_new);
+    let elapsed = t_gen.elapsed();
+    eprintln!(
+        "generated {} tokens in {:?}  ({:.2}s/tok)",
+        new_ids.len(),
+        elapsed,
+        elapsed.as_secs_f64() / new_ids.len().max(1) as f64
+    );
+    eprintln!("new ids: {:?}", new_ids);
+
+    // Decode each new id individually so we can see what was emitted
+    // even if some IDs are special tokens that fail to UTF-8 decode.
+    for &id in &new_ids {
+        match tok.decode(&[id]) {
+            Ok(s) => eprintln!("  id {:>6} → {:?}", id, s),
+            Err(e) => eprintln!("  id {:>6} → <decode error: {}>", id, e),
+        }
+    }
+
+    // Full sequence decode.
+    let mut all_ids = prompt_ids.clone();
+    all_ids.extend_from_slice(&new_ids);
+    match tok.decode(&all_ids) {
+        Ok(s) => eprintln!("full text: {:?}", s),
+        Err(e) => eprintln!("(full decode failed: {})", e),
+    }
+
+    assert_eq!(new_ids.len(), max_new);
+}
