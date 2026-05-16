@@ -7,7 +7,9 @@
 
 pub mod arch;
 pub mod gguf;
+pub mod loader;
 pub mod tokenizer;
 
 pub use gguf::{GgmlType, GgufError, GgufFile, KvType, KvValue, TensorInfo};
+pub use loader::{config_from_gguf, model_from_gguf};
 pub use tokenizer::{TokError, TokenBytes, Tokenizer};
