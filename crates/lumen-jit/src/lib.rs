@@ -9,6 +9,8 @@
 
 pub mod cache;
 pub mod exec;
+pub mod matmul_cache;
 
 pub use cache::CodeCache;
 pub use exec::{ExecError, ExecRegion};
+pub use matmul_cache::{JitError, MatmulFn, MatmulJitCache};
