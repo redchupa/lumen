@@ -22,9 +22,16 @@ and microkernel tuning. The gap is meaningful and we own it.
 
 | Path | Decode (tg32) tok/s | vs llama.cpp |
 |---|---:|---:|
-| Lumen naive Rust matmul | 2.91 | **14.2× slower** |
-| **Lumen JIT (4×8 tile / 1×8 AVX2)** | **4.43** | **9.3× slower** |
+| Lumen naive Rust matmul | 2.91 | 14.2× slower |
+| Lumen JIT (4×8 tile / 1×8 AVX2, 1-acc) | 4.43 | 9.3× slower |
+| **Lumen JIT (+ 1×N 4-acc decode path, Phase 7.C)** | **5.08** | **8.1× slower** |
 | llama.cpp (ggml) | 41.32 | 1.0× |
+
+The 4.43 → 5.08 jump (**+14.7%**) comes from breaking the 1-accumulator
+FMA dependency chain that bound the M=1 decode matmul path. The dispatcher
+now routes `M=1, N % 32 == 0` shapes — every weight matmul in
+autoregressive decode — to a 4-accumulator 1×32 stride kernel. Tokens
+remain bit-identical to the naive path.
 
 llama.cpp also reports a `pp128 = 160.82 tok/s` for prompt processing
 (batched 128 tokens). Lumen has no batched prefill yet — every prompt

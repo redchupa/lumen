@@ -195,11 +195,15 @@ fn emit_function(em: &mut Emitter, f: &Function, abi: Abi, avx2: bool) -> Result
     let p_out = abi.param_reg(f.params.len() as u32);
 
     // Automatic codegen synthesis — tile size selection.
-    // 1. 4×8 register tile when both M and N divide nicely (best throughput).
-    // 2. 1×8 AVX2 vectorization when only N divides.
-    // 3. Scalar fallback otherwise.
+    // 1. 4×8 register tile when both M and N divide nicely (best prefill throughput).
+    // 2. 1×N 4-accumulator AVX2 when M == 1 and N % 32 == 0 (best decode throughput —
+    //    breaks the single-accumulator FMA latency chain that bound the 1×8 path).
+    // 3. 1×8 AVX2 vectorization when only N % 8 divides.
+    // 4. Scalar fallback otherwise.
     if avx2 && m % 4 == 0 && n % 8 == 0 {
         emit_matmul_tile_4x8(em, p_lhs, p_rhs, p_out, m as i32, k as i32, n as i32, abi);
+    } else if avx2 && m == 1 && n % 32 == 0 {
+        emit_matmul_avx2_1xn_4acc(em, p_lhs, p_rhs, p_out, k as i32, n as i32, abi);
     } else if avx2 && n % 8 == 0 {
         emit_matmul_avx2(em, p_lhs, p_rhs, p_out, m as i32, k as i32, n as i32, abi);
     } else {
@@ -1135,6 +1139,141 @@ fn emit_dequant_q8_body(em: &mut Emitter, p_src: Reg, p_dst: Reg, num_blocks: i3
 ///       ymm3 = ymm3 + ymm5 * ymm4
 ///     store ymm0..ymm3 to 4 consecutive rows of `out`
 /// ```
+/// Decode-specialized AVX2 matmul: M=1, N % 32 == 0.
+///
+/// During autoregressive decode every weight matmul has shape `(1, K) @ (K, N)`.
+/// The original `emit_matmul_avx2` (M ≥ 1, 1 ymm accumulator per j-block of 8)
+/// runs one `vfmadd231ps` per kk step into a single live accumulator. With
+/// 4-cycle FMA latency that bottlenecks at ~1 FMA per 4 cycles regardless of
+/// throughput — even though Skylake/Zen3+ can issue 1–2 FMAs per cycle.
+///
+/// This path processes 32 output columns per j step using 4 independent ymm
+/// accumulators (ymm0..ymm3). Each kk iteration emits 4 FMAs into 4
+/// independent dependency chains, so the CPU's out-of-order engine can pipeline
+/// them and approach the 1 FMA/cycle issue rate.
+///
+/// ```text
+/// for j in 0..N step 32:
+///   ymm0..ymm3 = 0
+///   for kk in 0..K:
+///     ymm4 = broadcast lhs[kk]            ; M=1, so a_idx = kk
+///     rdx  = kk*N + j
+///     ymm0 += ymm4 * [rhs + rdx*4 +  0]
+///     ymm1 += ymm4 * [rhs + rdx*4 + 32]
+///     ymm2 += ymm4 * [rhs + rdx*4 + 64]
+///     ymm3 += ymm4 * [rhs + rdx*4 + 96]
+///   store ymm0..ymm3 -> out[j .. j+32]
+/// ```
+fn emit_matmul_avx2_1xn_4acc(
+    em: &mut Emitter,
+    p_lhs: Reg,
+    p_rhs: Reg,
+    p_out: Reg,
+    k: i32,
+    n: i32,
+    abi: Abi,
+) {
+    debug_assert!(n % 32 == 0, "1xN-4acc path requires N % 32 == 0");
+
+    // ---- prologue ----
+    // Same callee-saved set as the other AVX2 paths so the stack layout is
+    // identical from the JIT's point of view. We don't actually clobber R15
+    // here (no outer i loop) but pushing it keeps the prologue/epilogue
+    // structurally consistent across the family.
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_lhs);
+    mov_rr(em, Reg::R13, p_rhs);
+    mov_rr(em, Reg::R14, p_out);
+
+    // RBX = j (column block, steps by 32). No outer i loop — M = 1.
+    xor_rr(em, Reg::RBX);
+    let j_loop = em.len();
+    cmp_ri32(em, Reg::RBX, n);
+    let jge_j = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // 4 accumulators = 0
+    vxorps_zero(em, Ymm(0));
+    vxorps_zero(em, Ymm(1));
+    vxorps_zero(em, Ymm(2));
+    vxorps_zero(em, Ymm(3));
+
+    xor_rr(em, Reg::RCX); // kk = 0
+    let k_loop = em.len();
+    cmp_ri32(em, Reg::RCX, k);
+    let jge_k = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // ymm4 = broadcast lhs[kk]   ; M = 1 ⇒ a_idx = kk = RCX
+    vbroadcastss(em, Ymm(4), Reg::R12, Some((Reg::RCX, Scale::S4)), 0);
+
+    // RDX = kk*N + j
+    mov_rr(em, Reg::RDX, Reg::RCX);
+    imul_rri32(em, Reg::RDX, Reg::RDX, n);
+    add_rr(em, Reg::RDX, Reg::RBX);
+
+    // 4 independent FMA chains, 8 lanes each, contiguous in B.
+    vfmadd231ps_mem(em, Ymm(0), Ymm(4), Reg::R13, Some((Reg::RDX, Scale::S4)), 0);
+    vfmadd231ps_mem(
+        em,
+        Ymm(1),
+        Ymm(4),
+        Reg::R13,
+        Some((Reg::RDX, Scale::S4)),
+        32,
+    );
+    vfmadd231ps_mem(
+        em,
+        Ymm(2),
+        Ymm(4),
+        Reg::R13,
+        Some((Reg::RDX, Scale::S4)),
+        64,
+    );
+    vfmadd231ps_mem(
+        em,
+        Ymm(3),
+        Ymm(4),
+        Reg::R13,
+        Some((Reg::RDX, Scale::S4)),
+        96,
+    );
+
+    inc_r(em, Reg::RCX);
+    let jmp_k = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_k, k_loop);
+
+    let k_done = em.len();
+    patch_rel32(em, jge_k, k_done);
+
+    // Store ymm0..ymm3 -> out[0, j..j+32]. M = 1 ⇒ out_idx = j = RBX.
+    vmovups_store(em, Ymm(0), Reg::R14, Some((Reg::RBX, Scale::S4)), 0);
+    vmovups_store(em, Ymm(1), Reg::R14, Some((Reg::RBX, Scale::S4)), 32);
+    vmovups_store(em, Ymm(2), Reg::R14, Some((Reg::RBX, Scale::S4)), 64);
+    vmovups_store(em, Ymm(3), Reg::R14, Some((Reg::RBX, Scale::S4)), 96);
+
+    add_ri32(em, Reg::RBX, 32);
+    let jmp_j = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_j, j_loop);
+
+    let j_done = em.len();
+    patch_rel32(em, jge_j, j_done);
+
+    // ---- epilogue ----
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_matmul_tile_4x8(
     em: &mut Emitter,

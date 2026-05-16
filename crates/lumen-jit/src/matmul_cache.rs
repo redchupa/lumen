@@ -169,6 +169,53 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    /// Phase 7.C: decode-shape (M=1, N % 32 == 0) hits the new 1xN 4-acc AVX2
+    /// path. Validates the new dispatcher branch and the emitted code against
+    /// the same naive baseline.
+    #[test]
+    fn decode_shape_1xn_4acc_path_matches_naive() {
+        let mut cache = MatmulJitCache::new();
+        // Mix of K values, all N divisible by 32 — covers lm_head (large N),
+        // FFN-style (medium N), and projection (smaller N).
+        for &(m, k, n) in &[
+            (1u32, 16, 32),
+            (1, 32, 64),
+            (1, 64, 96),
+            (1, 128, 256),
+            (1, 7, 32),  // odd K
+            (1, 13, 64), // odd K, larger N
+        ] {
+            let f = cache
+                .get_or_compile(m, k, n)
+                .unwrap_or_else(|e| panic!("compile ({},{},{}): {}", m, k, n, e));
+
+            let a: Vec<f32> = (0..(m * k) as usize)
+                .map(|i| ((i % 5) as f32) * 0.21 - 0.3)
+                .collect();
+            let b: Vec<f32> = (0..(k * n) as usize)
+                .map(|i| ((i % 13) as f32) * 0.07 + 0.05)
+                .collect();
+            let mut out = vec![0.0f32; (m * n) as usize];
+            // SAFETY: kernel compiled for these exact (M,K,N).
+            unsafe { f(a.as_ptr(), b.as_ptr(), out.as_mut_ptr()) };
+
+            let want = naive(&a, &b, m as usize, k as usize, n as usize);
+            let tol = 1e-3 * (k as f32).max(1.0);
+            for (g, w) in out.iter().zip(want.iter()) {
+                assert!(
+                    (g - w).abs() < tol,
+                    "shape ({},{},{}): {} vs {} (tol {})",
+                    m,
+                    k,
+                    n,
+                    g,
+                    w,
+                    tol
+                );
+            }
+        }
+    }
+
     #[test]
     fn multiple_shapes_round_trip_correctly() {
         let mut cache = MatmulJitCache::new();
