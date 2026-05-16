@@ -225,6 +225,70 @@ fn transpose_n_k_to_k_n(src: &[f32], n: usize, k: usize) -> Vec<f32> {
     out
 }
 
+/// Phase 7.A bench (naive): same 32-token decode through the in-tree naive
+/// matmul. Reference for "how much did JIT help" and the comparison row vs
+/// llama.cpp.
+#[test]
+#[ignore = "loads ~640MB; ~17s in release; for benchmarking only"]
+fn qwen_bench_tg32_naive() {
+    if !check_qwen_present() {
+        eprintln!("skip: {} not present", QWEN_PATH);
+        return;
+    }
+    let file = GgufFile::open(QWEN_PATH).expect("open gguf");
+    let model = model_from_gguf(&file, "qwen2").expect("model");
+    let tok = Tokenizer::from_gguf(&file).expect("tokenizer");
+
+    let prompt_ids = tok.encode("안녕");
+    let max_new = 32usize;
+
+    let t = std::time::Instant::now();
+    let new_ids = model.generate_greedy(&prompt_ids, max_new);
+    let elapsed = t.elapsed();
+    let tps = max_new as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "Lumen naive tg32: {} tokens in {:?}  =>  {:.2} tok/s (single-thread)",
+        new_ids.len(),
+        elapsed,
+        tps
+    );
+    assert_eq!(new_ids.len().max(1), new_ids.len());
+}
+
+/// Phase 7.A bench: run Qwen2.5-0.5B for 32 decode tokens via the JIT path
+/// so we can compare against llama-bench `tg32`. Single-threaded — matches
+/// our backend's thread model.
+#[test]
+#[ignore = "loads ~640MB; ~12s in release; for benchmarking only"]
+fn qwen_bench_tg32_jit() {
+    if !check_qwen_present() {
+        eprintln!("skip: {} not present", QWEN_PATH);
+        return;
+    }
+    let file = GgufFile::open(QWEN_PATH).expect("open gguf");
+    let mut model = model_from_gguf(&file, "qwen2").expect("model");
+    let tok = Tokenizer::from_gguf(&file).expect("tokenizer");
+    model.transpose_for_jit();
+
+    let prompt_ids = tok.encode("안녕"); // small prompt; bench focuses on decode
+    let max_new = 32usize;
+
+    let t = std::time::Instant::now();
+    let new_ids = model.generate_greedy_jit(&prompt_ids, max_new);
+    let elapsed = t.elapsed();
+    let tps = max_new as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "Lumen JIT tg32: {} tokens in {:?}  =>  {:.2} tok/s (single-thread)",
+        new_ids.len(),
+        elapsed,
+        tps
+    );
+
+    // No correctness assertion here — that's covered by other tests. This
+    // exists purely as a benchmark.
+    assert_eq!(new_ids.len().max(1), new_ids.len());
+}
+
 /// Phase 6.G.3: full-model JIT path through `generate_greedy_jit`.
 ///
 /// Runs Qwen2.5-0.5B twice on the same prompt — once through the naive

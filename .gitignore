@@ -35,3 +35,9 @@ Thumbs.db
 perf.data*
 *.perf
 flamegraph.svg
+
+# Benchmark tools (external binaries / outputs)
+/tools/llama-cpp/
+/tools/llama-cpp.zip
+/tools/llama-*.txt
+/tools/llama-*.txt.err
