@@ -368,6 +368,130 @@ pub fn forward_layer_decode(
     resid
 }
 
+use crate::kvcache::KvCache;
+
+/// Top-level model hyperparameters: a `LayerConfig` plus vocab and depth.
+#[derive(Clone, Debug)]
+pub struct ModelConfig {
+    pub layer: LayerConfig,
+    pub vocab_size: usize,
+    pub n_layers: usize,
+    pub max_seq: usize,
+    pub eos_token_id: Option<u32>,
+}
+
+impl ModelConfig {
+    pub fn hidden(&self) -> usize {
+        self.layer.hidden
+    }
+}
+
+/// A full transformer ready to generate.
+///
+/// Weight layout, all row-major:
+/// - `token_embeddings`: `[vocab_size, hidden]`
+/// - `lm_head_w`: `[vocab_size, hidden]` (weight-tied with embeddings is a
+///   common option; we keep them separate here so toy tests can vary them
+///   independently)
+/// - `final_norm_w`: `[hidden]`
+/// - `layers[i]`: standard `LayerWeights`
+#[derive(Clone, Debug)]
+pub struct Model {
+    pub config: ModelConfig,
+    pub token_embeddings: Vec<f32>,
+    pub layers: Vec<LayerWeights>,
+    pub final_norm_w: Vec<f32>,
+    pub lm_head_w: Vec<f32>,
+}
+
+impl Model {
+    /// Look up one token's embedding row.
+    fn embed_token(&self, token: u32) -> Vec<f32> {
+        let h = self.config.hidden();
+        let off = token as usize * h;
+        self.token_embeddings[off..off + h].to_vec()
+    }
+
+    /// Run one decode step through every layer, then `final_norm` + `lm_head`.
+    /// Returns logits over the vocabulary.
+    pub fn forward_decode(&self, token: u32, position: u32, cache: &mut KvCache) -> Vec<f32> {
+        assert_eq!(cache.n_layers(), self.config.n_layers);
+        let mut x = self.embed_token(token);
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = forward_layer_decode(&x, position, layer, cache.layer_mut(i), &self.config.layer);
+        }
+        // Final RMSNorm
+        let mut x_norm = vec![0.0f32; self.config.hidden()];
+        rms_norm(
+            &x,
+            &self.final_norm_w,
+            &mut x_norm,
+            self.config.hidden(),
+            self.config.layer.rms_norm_eps,
+        );
+        // lm_head projection: [1, hidden] @ [vocab, hidden]^T → [vocab]
+        weight_matmul(
+            &x_norm,
+            &self.lm_head_w,
+            1,
+            self.config.hidden(),
+            self.config.vocab_size,
+        )
+    }
+
+    /// Generate up to `max_new` tokens. Greedy sampling (argmax of logits).
+    /// Stops early on EOS if `eos_token_id` is set.
+    ///
+    /// Returns *only the newly generated* tokens (not the prompt).
+    pub fn generate_greedy(&self, prompt: &[u32], max_new: usize) -> Vec<u32> {
+        assert!(!prompt.is_empty(), "prompt must contain at least one token");
+        assert!(
+            prompt.len() + max_new <= self.config.max_seq,
+            "prompt+max_new ({}) exceeds max_seq ({})",
+            prompt.len() + max_new,
+            self.config.max_seq,
+        );
+
+        let mut cache = KvCache::new(
+            self.config.n_layers,
+            self.config.max_seq,
+            self.config.layer.kv_dim(),
+        );
+
+        // Prefill: feed each prompt token through the decode path so the cache
+        // is populated. The last call's logits become our first predictor.
+        let mut last_logits = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            last_logits = self.forward_decode(tok, pos as u32, &mut cache);
+        }
+
+        let mut out = Vec::with_capacity(max_new);
+        for i in 0..max_new {
+            let next = argmax(&last_logits) as u32;
+            out.push(next);
+            if Some(next) == self.config.eos_token_id {
+                break;
+            }
+            let next_pos = (prompt.len() + i) as u32;
+            last_logits = self.forward_decode(next, next_pos, &mut cache);
+        }
+        out
+    }
+}
+
+fn argmax(v: &[f32]) -> usize {
+    debug_assert!(!v.is_empty());
+    let mut best_i = 0usize;
+    let mut best_v = v[0];
+    for (i, &x) in v.iter().enumerate().skip(1) {
+        if x > best_v {
+            best_v = x;
+            best_i = i;
+        }
+    }
+    best_i
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +657,75 @@ mod tests {
         for v in &out {
             assert!(v.is_finite());
         }
+    }
+
+    // ------------- Model / generate tests -----------------------------------
+
+    fn toy_model(seed: u64, vocab: usize, n_layers: usize) -> Model {
+        let layer_cfg = toy_cfg();
+        let cfg = ModelConfig {
+            layer: layer_cfg.clone(),
+            vocab_size: vocab,
+            n_layers,
+            max_seq: 32,
+            eos_token_id: None,
+        };
+        let mut s = seed | 1;
+        let mut next = || -> f32 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s as i32 as f32) * 1e-10
+        };
+        let h = cfg.hidden();
+        Model {
+            token_embeddings: (0..vocab * h).map(|_| next()).collect(),
+            layers: (0..n_layers)
+                .map(|i| random_weights(&layer_cfg, seed + i as u64))
+                .collect(),
+            final_norm_w: vec![1.0; h],
+            lm_head_w: (0..vocab * h).map(|_| next()).collect(),
+            config: cfg,
+        }
+    }
+
+    #[test]
+    fn generate_produces_expected_length() {
+        let model = toy_model(31, 64, 2);
+        let out = model.generate_greedy(&[5, 10, 15], 7);
+        assert_eq!(out.len(), 7);
+        for &t in &out {
+            assert!((t as usize) < model.config.vocab_size);
+        }
+    }
+
+    #[test]
+    fn generate_is_deterministic() {
+        let model = toy_model(73, 64, 2);
+        let a = model.generate_greedy(&[1, 2, 3], 8);
+        let b = model.generate_greedy(&[1, 2, 3], 8);
+        assert_eq!(a, b);
+    }
+
+    /// Generated sequence must vary when the prompt varies (sanity check that
+    /// the model is actually reading its input rather than ignoring it).
+    #[test]
+    fn generate_responds_to_prompt() {
+        let model = toy_model(101, 64, 2);
+        let a = model.generate_greedy(&[5], 5);
+        let b = model.generate_greedy(&[42], 5);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn eos_stops_generation_early() {
+        let mut model = toy_model(7, 64, 2);
+        // Probe which token would come first for prompt = [0]; force it as EOS.
+        let probe = model.generate_greedy(&[0], 1);
+        model.config.eos_token_id = Some(probe[0]);
+        let out = model.generate_greedy(&[0], 20);
+        // Should stop at the first generated token (the one that equals EOS).
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], probe[0]);
     }
 }

@@ -10,7 +10,11 @@ pub mod pool;
 pub mod quant;
 pub mod tensor;
 
-pub use model::{forward_layer, multi_head_attention, LayerConfig, LayerWeights};
+pub use kvcache::{KvCache, LayerKvCache};
+pub use model::{
+    forward_layer, forward_layer_decode, multi_head_attention, LayerConfig, LayerWeights, Model,
+    ModelConfig,
+};
 pub use ops::{mul_in_place, rms_norm, rope_in_place, silu_in_place, softmax_rows};
 
 pub use quant::{
