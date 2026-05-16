@@ -15,6 +15,7 @@
 
 use crate::kvcache::LayerKvCache;
 use crate::ops::{mul_in_place, rms_norm, rope_in_place, silu_in_place, softmax_rows};
+use lumen_jit::MatmulJitCache;
 
 /// Architecture hyperparameters for one Llama-family transformer.
 #[derive(Clone, Debug)]
@@ -64,6 +65,64 @@ pub struct LayerWeights {
     pub b_q: Option<Vec<f32>>, // [q_dim]
     pub b_k: Option<Vec<f32>>, // [kv_dim]
     pub b_v: Option<Vec<f32>>, // [kv_dim]
+}
+
+/// Transpose a `[d_out, d_in]` row-major matrix into `[d_in, d_out]` row-major,
+/// returning a fresh allocation. Used to convert ggml-convention weights into
+/// a layout the Lumen JIT matmul kernels can consume directly.
+pub fn transpose_2d(src: &[f32], d_out: usize, d_in: usize) -> Vec<f32> {
+    debug_assert_eq!(src.len(), d_out * d_in);
+    let mut out = vec![0.0f32; d_out * d_in];
+    for o in 0..d_out {
+        for k in 0..d_in {
+            out[k * d_out + o] = src[o * d_in + k];
+        }
+    }
+    out
+}
+
+impl LayerWeights {
+    /// Transpose every weight matrix from `[d_out, d_in]` (ggml convention)
+    /// into `[d_in, d_out]` (the layout the JIT matmul kernels expect for
+    /// their `B` operand). After calling this, the layer is *only* usable
+    /// via the `_jit` forward functions.
+    ///
+    /// Peak extra memory during the call is one weight matrix's worth — the
+    /// old buffer is dropped as soon as the transpose finishes.
+    pub fn transpose_in_place(&mut self, cfg: &LayerConfig) {
+        let h = cfg.hidden;
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+        let ff = cfg.ffn_hidden;
+        self.wq = transpose_2d(&self.wq, qd, h);
+        self.wk = transpose_2d(&self.wk, kvd, h);
+        self.wv = transpose_2d(&self.wv, kvd, h);
+        self.wo = transpose_2d(&self.wo, h, qd);
+        self.w_gate = transpose_2d(&self.w_gate, ff, h);
+        self.w_up = transpose_2d(&self.w_up, ff, h);
+        self.w_down = transpose_2d(&self.w_down, h, ff);
+    }
+}
+
+/// JIT-backed matmul: `out [rows, d_out] = a [rows, d_in] @ w_t [d_in, d_out]`.
+/// `w_t` must already be in transposed (post-`transpose_in_place`) layout.
+fn weight_matmul_jit(
+    a: &[f32],
+    w_t: &[f32],
+    rows: usize,
+    d_in: usize,
+    d_out: usize,
+    jit: &mut MatmulJitCache,
+) -> Vec<f32> {
+    let f = jit
+        .get_or_compile(rows as u32, d_in as u32, d_out as u32)
+        .expect("matmul JIT compile");
+    let mut out = vec![0.0f32; rows * d_out];
+    // SAFETY: cache returned a kernel compiled for exactly (rows, d_in, d_out).
+    unsafe {
+        f(a.as_ptr(), w_t.as_ptr(), out.as_mut_ptr());
+    }
+    out
 }
 
 /// Add `bias` broadcast across each row of `x` (shape `[rows, dim]`).
@@ -403,6 +462,104 @@ pub fn forward_layer_decode(
 
 use crate::kvcache::KvCache;
 
+/// JIT variant of [`forward_layer_decode`]: same forward semantics, same
+/// inputs/outputs, but the seven weight matmuls in the layer go through
+/// the JIT cache. Caller must have already called `transpose_in_place` on
+/// this layer.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_layer_decode_jit(
+    x_t: &[f32],
+    position: u32,
+    layer: &LayerWeights,
+    cache: &mut LayerKvCache,
+    cfg: &LayerConfig,
+    jit: &mut MatmulJitCache,
+) -> Vec<f32> {
+    assert_eq!(x_t.len(), cfg.hidden);
+    assert_eq!(cache.kv_dim(), cfg.kv_dim());
+
+    // 1. attention RMSNorm
+    let mut x_norm = vec![0.0f32; cfg.hidden];
+    rms_norm(
+        x_t,
+        &layer.attn_norm_w,
+        &mut x_norm,
+        cfg.hidden,
+        cfg.rms_norm_eps,
+    );
+
+    // 2. Q/K/V projection through JIT, plus optional biases.
+    let mut q = weight_matmul_jit(&x_norm, &layer.wq, 1, cfg.hidden, cfg.q_dim(), jit);
+    let mut k = weight_matmul_jit(&x_norm, &layer.wk, 1, cfg.hidden, cfg.kv_dim(), jit);
+    let mut v = weight_matmul_jit(&x_norm, &layer.wv, 1, cfg.hidden, cfg.kv_dim(), jit);
+    if let Some(b) = &layer.b_q {
+        add_bias_broadcast(&mut q, b, cfg.q_dim());
+    }
+    if let Some(b) = &layer.b_k {
+        add_bias_broadcast(&mut k, b, cfg.kv_dim());
+    }
+    if let Some(b) = &layer.b_v {
+        add_bias_broadcast(&mut v, b, cfg.kv_dim());
+    }
+
+    // 3. RoPE
+    rope_in_place(
+        &mut q,
+        &[position],
+        cfg.n_heads,
+        cfg.head_dim,
+        cfg.rope_base,
+    );
+    rope_in_place(
+        &mut k,
+        &[position],
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        cfg.rope_base,
+    );
+
+    // 4. Append to cache, attention.
+    cache.append(&k, &v);
+    let attn = attention_decode(&q, cache, cfg);
+
+    // 5. output projection (wo: was [hidden, q_dim] → transposed to [q_dim, hidden])
+    let attn_out = weight_matmul_jit(&attn, &layer.wo, 1, cfg.q_dim(), cfg.hidden, jit);
+
+    // 6. residual
+    let mut resid: Vec<f32> = x_t
+        .iter()
+        .zip(attn_out.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+
+    // 7. FFN RMSNorm
+    let mut ffn_in = vec![0.0f32; cfg.hidden];
+    rms_norm(
+        &resid,
+        &layer.ffn_norm_w,
+        &mut ffn_in,
+        cfg.hidden,
+        cfg.rms_norm_eps,
+    );
+
+    // 8. gate/up
+    let mut gate = weight_matmul_jit(&ffn_in, &layer.w_gate, 1, cfg.hidden, cfg.ffn_hidden, jit);
+    let up = weight_matmul_jit(&ffn_in, &layer.w_up, 1, cfg.hidden, cfg.ffn_hidden, jit);
+
+    // 9. SiLU(gate) * up
+    silu_in_place(&mut gate);
+    mul_in_place(&mut gate, &up);
+
+    // 10. down
+    let ffn_out = weight_matmul_jit(&gate, &layer.w_down, 1, cfg.ffn_hidden, cfg.hidden, jit);
+
+    // 11. residual
+    for (r, o) in resid.iter_mut().zip(ffn_out.iter()) {
+        *r += *o;
+    }
+    resid
+}
+
 /// Top-level model hyperparameters: a `LayerConfig` plus vocab and depth.
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -470,6 +627,93 @@ impl Model {
             self.config.hidden(),
             self.config.vocab_size,
         )
+    }
+
+    /// Transpose every weight matrix in the model so the JIT matmul kernels
+    /// can consume them. After this, only the `*_jit` variants are valid;
+    /// calling `forward_decode` / `generate_greedy` will produce garbage.
+    pub fn transpose_for_jit(&mut self) {
+        for layer in &mut self.layers {
+            layer.transpose_in_place(&self.config.layer);
+        }
+        // lm_head was stored as [vocab, hidden] (ggml); transpose to [hidden, vocab].
+        self.lm_head_w = transpose_2d(
+            &self.lm_head_w,
+            self.config.vocab_size,
+            self.config.hidden(),
+        );
+    }
+
+    /// JIT variant of [`Self::forward_decode`]. Caller must have called
+    /// [`Self::transpose_for_jit`] first.
+    pub fn forward_decode_jit(
+        &self,
+        token: u32,
+        position: u32,
+        cache: &mut KvCache,
+        jit: &mut MatmulJitCache,
+    ) -> Vec<f32> {
+        assert_eq!(cache.n_layers(), self.config.n_layers);
+        let mut x = self.embed_token(token);
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = forward_layer_decode_jit(
+                &x,
+                position,
+                layer,
+                cache.layer_mut(i),
+                &self.config.layer,
+                jit,
+            );
+        }
+        // Final RMSNorm
+        let mut x_norm = vec![0.0f32; self.config.hidden()];
+        rms_norm(
+            &x,
+            &self.final_norm_w,
+            &mut x_norm,
+            self.config.hidden(),
+            self.config.layer.rms_norm_eps,
+        );
+        // lm_head projection through JIT (lm_head_w is now [hidden, vocab]).
+        weight_matmul_jit(
+            &x_norm,
+            &self.lm_head_w,
+            1,
+            self.config.hidden(),
+            self.config.vocab_size,
+            jit,
+        )
+    }
+
+    /// JIT variant of [`Self::generate_greedy`]. Caller must have called
+    /// [`Self::transpose_for_jit`] first.
+    pub fn generate_greedy_jit(&self, prompt: &[u32], max_new: usize) -> Vec<u32> {
+        assert!(!prompt.is_empty());
+        assert!(prompt.len() + max_new <= self.config.max_seq);
+
+        let mut cache = KvCache::new(
+            self.config.n_layers,
+            prompt.len() + max_new,
+            self.config.layer.kv_dim(),
+        );
+        let mut jit = MatmulJitCache::new();
+
+        let mut last_logits = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            last_logits = self.forward_decode_jit(tok, pos as u32, &mut cache, &mut jit);
+        }
+
+        let mut out = Vec::with_capacity(max_new);
+        for i in 0..max_new {
+            let next = argmax(&last_logits) as u32;
+            out.push(next);
+            if Some(next) == self.config.eos_token_id {
+                break;
+            }
+            let next_pos = (prompt.len() + i) as u32;
+            last_logits = self.forward_decode_jit(next, next_pos, &mut cache, &mut jit);
+        }
+        out
     }
 
     /// Generate up to `max_new` tokens. Greedy sampling (argmax of logits).

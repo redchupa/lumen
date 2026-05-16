@@ -225,6 +225,73 @@ fn transpose_n_k_to_k_n(src: &[f32], n: usize, k: usize) -> Vec<f32> {
     out
 }
 
+/// Phase 6.G.3: full-model JIT path through `generate_greedy_jit`.
+///
+/// Runs Qwen2.5-0.5B twice on the same prompt — once through the naive
+/// `generate_greedy`, once through `generate_greedy_jit` after
+/// `transpose_for_jit`. The two paths must produce the *same token sequence*
+/// (greedy decode is deterministic, so JIT path correctness is binary).
+/// We also print both wall-clock times so the speedup over the full
+/// 24-layer forward is visible.
+#[test]
+#[ignore = "loads ~640MB, runs Qwen forward twice; release recommended"]
+fn qwen_generate_jit_matches_naive_and_speed() {
+    if !check_qwen_present() {
+        eprintln!("skip: {} not present", QWEN_PATH);
+        return;
+    }
+    let file = GgufFile::open(QWEN_PATH).expect("open gguf");
+    let model_naive = model_from_gguf(&file, "qwen2").expect("model");
+    let tok = Tokenizer::from_gguf(&file).expect("tokenizer");
+
+    let prompt_ids = tok.encode("안녕");
+    eprintln!("prompt ids: {:?}", prompt_ids);
+    let max_new = 3usize;
+
+    // --- naive path ---
+    let t = std::time::Instant::now();
+    let naive_ids = model_naive.generate_greedy(&prompt_ids, max_new);
+    let naive_elapsed = t.elapsed();
+    eprintln!(
+        "naive: {:>10?}  ({:.2}s/tok)  ids = {:?}",
+        naive_elapsed,
+        naive_elapsed.as_secs_f64() / max_new as f64,
+        naive_ids
+    );
+
+    // --- JIT path: load fresh + transpose ---
+    let mut model_jit = model_from_gguf(&file, "qwen2").expect("model for jit");
+    let t = std::time::Instant::now();
+    model_jit.transpose_for_jit();
+    let transp_elapsed = t.elapsed();
+    eprintln!("transpose_for_jit: {:>10?}  (one-time)", transp_elapsed);
+
+    let t = std::time::Instant::now();
+    let jit_ids = model_jit.generate_greedy_jit(&prompt_ids, max_new);
+    let jit_elapsed = t.elapsed();
+    eprintln!(
+        "JIT  : {:>10?}  ({:.2}s/tok)  ids = {:?}",
+        jit_elapsed,
+        jit_elapsed.as_secs_f64() / max_new as f64,
+        jit_ids
+    );
+
+    let speedup = naive_elapsed.as_secs_f64() / jit_elapsed.as_secs_f64();
+    eprintln!("speedup: {:.2}x (full forward, naive vs JIT)", speedup);
+
+    // Correctness: greedy decode is deterministic; the two paths must agree
+    // on every emitted token id.
+    assert_eq!(
+        jit_ids, naive_ids,
+        "JIT and naive disagree on greedy decode"
+    );
+
+    // Sanity: decode both and confirm we got actual Korean.
+    let mut all = prompt_ids.clone();
+    all.extend_from_slice(&jit_ids);
+    eprintln!("output: {:?}", tok.decode(&all).unwrap_or_default());
+}
+
 /// Phase 6.G.2 demo: run Qwen's lm_head (M=1, K=896, N=151936) through
 /// (a) the in-tree naive matmul and (b) the Phase 6.G.1 JIT cache after
 /// transposing the weight to row-major `[K, N]`. Verify the results agree
