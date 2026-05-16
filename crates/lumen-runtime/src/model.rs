@@ -13,6 +13,7 @@
 //! All weights are fp32 here; quantized weights and the JIT kernel hookup
 //! land alongside Phase 6.F when we wire a real GGUF model.
 
+use crate::kvcache::LayerKvCache;
 use crate::ops::{mul_in_place, rms_norm, rope_in_place, silu_in_place, softmax_rows};
 
 /// Architecture hyperparameters for one Llama-family transformer.
@@ -228,6 +229,145 @@ pub fn forward_layer(
     resid
 }
 
+/// Cache-backed attention for a single query token at position `cur_pos`.
+///
+/// Inputs:
+/// - `q_t`: rotated query for this token, shape `[n_heads, head_dim]`.
+/// - `cache`: layer cache, already containing the new K/V row appended.
+///   So `cache.len() == cur_pos + 1` (caller is responsible for the append).
+///
+/// Returns: attention output for this token, shape `[n_heads * head_dim]`.
+fn attention_decode(q_t: &[f32], cache: &LayerKvCache, cfg: &LayerConfig) -> Vec<f32> {
+    let h = cfg.n_heads;
+    let kvh = cfg.n_kv_heads;
+    let hd = cfg.head_dim;
+    let group = cfg.heads_per_kv();
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let t_plus_1 = cache.len();
+    debug_assert!(t_plus_1 >= 1);
+
+    let k_filled = cache.k_filled();
+    let v_filled = cache.v_filled();
+
+    let mut out = vec![0.0f32; h * hd];
+
+    for head in 0..h {
+        let kv_head = head / group;
+        let q_off = head * hd;
+
+        let mut scores = vec![0.0f32; t_plus_1];
+        for (i, score) in scores.iter_mut().enumerate() {
+            let k_off = i * kvh * hd + kv_head * hd;
+            let mut s = 0.0f32;
+            for d in 0..hd {
+                s += q_t[q_off + d] * k_filled[k_off + d];
+            }
+            *score = s * scale;
+        }
+        softmax_rows(&mut scores, t_plus_1);
+
+        let out_off = head * hd;
+        for (i, &w) in scores.iter().enumerate() {
+            let v_off = i * kvh * hd + kv_head * hd;
+            for d in 0..hd {
+                out[out_off + d] += w * v_filled[v_off + d];
+            }
+        }
+    }
+    out
+}
+
+/// Single-token decode forward through one transformer layer, mutating the
+/// per-layer KV cache. The input `x_t` is `[hidden]`; the output replaces
+/// it (also `[hidden]`).
+///
+/// Steps mirror `forward_layer` but with `seq == 1` and Q/K/V rows
+/// appended to the cache instead of recomputed for every past token.
+pub fn forward_layer_decode(
+    x_t: &[f32],
+    position: u32,
+    layer: &LayerWeights,
+    cache: &mut LayerKvCache,
+    cfg: &LayerConfig,
+) -> Vec<f32> {
+    assert_eq!(x_t.len(), cfg.hidden);
+    assert_eq!(cache.kv_dim(), cfg.kv_dim());
+
+    // 1. attention RMSNorm
+    let mut x_norm = vec![0.0f32; cfg.hidden];
+    rms_norm(
+        x_t,
+        &layer.attn_norm_w,
+        &mut x_norm,
+        cfg.hidden,
+        cfg.rms_norm_eps,
+    );
+
+    // 2. Q / K / V projection (single row each)
+    let mut q = weight_matmul(&x_norm, &layer.wq, 1, cfg.hidden, cfg.q_dim());
+    let mut k = weight_matmul(&x_norm, &layer.wk, 1, cfg.hidden, cfg.kv_dim());
+    let v = weight_matmul(&x_norm, &layer.wv, 1, cfg.hidden, cfg.kv_dim());
+
+    // 3. RoPE on q and k at the current position
+    rope_in_place(
+        &mut q,
+        &[position],
+        cfg.n_heads,
+        cfg.head_dim,
+        cfg.rope_base,
+    );
+    rope_in_place(
+        &mut k,
+        &[position],
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        cfg.rope_base,
+    );
+
+    // 4. Append K/V to cache.
+    cache.append(&k, &v);
+
+    // 5. Cache-backed attention
+    let attn = attention_decode(&q, cache, cfg);
+
+    // 6. output projection
+    let attn_out = weight_matmul(&attn, &layer.wo, 1, cfg.q_dim(), cfg.hidden);
+
+    // 7. residual
+    let mut resid: Vec<f32> = x_t
+        .iter()
+        .zip(attn_out.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+
+    // 8. FFN RMSNorm
+    let mut ffn_in = vec![0.0f32; cfg.hidden];
+    rms_norm(
+        &resid,
+        &layer.ffn_norm_w,
+        &mut ffn_in,
+        cfg.hidden,
+        cfg.rms_norm_eps,
+    );
+
+    // 9. gate/up
+    let mut gate = weight_matmul(&ffn_in, &layer.w_gate, 1, cfg.hidden, cfg.ffn_hidden);
+    let up = weight_matmul(&ffn_in, &layer.w_up, 1, cfg.hidden, cfg.ffn_hidden);
+
+    // 10. SiLU(gate) * up
+    silu_in_place(&mut gate);
+    mul_in_place(&mut gate, &up);
+
+    // 11. down
+    let ffn_out = weight_matmul(&gate, &layer.w_down, 1, cfg.ffn_hidden, cfg.hidden);
+
+    // 12. residual
+    for (r, o) in resid.iter_mut().zip(ffn_out.iter()) {
+        *r += *o;
+    }
+    resid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +468,55 @@ mod tests {
                 b
             );
         }
+    }
+
+    /// The decode path must match the prefill path for the *same* token
+    /// sequence: prefill on [t0, t1, t2] should give the same last-row output
+    /// as prefill on [t0, t1] followed by decode on t2.
+    ///
+    /// This is the property that makes autoregressive generation correct.
+    #[test]
+    fn decode_matches_prefill() {
+        let cfg = toy_cfg();
+        let layer = random_weights(&cfg, 13);
+        let h = cfg.hidden;
+
+        let x0 = vec![0.3f32; h];
+        let x1 = vec![0.7f32; h];
+        let x2 = vec![-0.4f32; h];
+
+        // Path A: prefill on all three tokens.
+        let mut all = Vec::with_capacity(3 * h);
+        all.extend_from_slice(&x0);
+        all.extend_from_slice(&x1);
+        all.extend_from_slice(&x2);
+        let prefill_out = forward_layer(&all, 3, &layer, &[0, 1, 2], &cfg);
+        let last_row_prefill = &prefill_out[2 * h..3 * h];
+
+        // Path B: prefill on first two tokens (just to populate the cache),
+        // then decode the third.
+        let mut cache = LayerKvCache::new(8, cfg.kv_dim());
+
+        // We need a decode-path warm-up: decode each of t0 and t1 to fill the
+        // cache. The decode path is logically equivalent to prefill-of-1 for
+        // each position when run sequentially.
+        let _ = forward_layer_decode(&x0, 0, &layer, &mut cache, &cfg);
+        let _ = forward_layer_decode(&x1, 1, &layer, &mut cache, &cfg);
+        let decode_out = forward_layer_decode(&x2, 2, &layer, &mut cache, &cfg);
+
+        for i in 0..h {
+            let a = last_row_prefill[i];
+            let b = decode_out[i];
+            assert!(
+                (a - b).abs() < 1e-4,
+                "decode/prefill diverge at idx {}: prefill={} decode={}",
+                i,
+                a,
+                b
+            );
+        }
+        // Cache holds 3 K/V rows.
+        assert_eq!(cache.len(), 3);
     }
 
     /// GQA sanity: with n_kv_heads = n_heads (no grouping) the layer still
