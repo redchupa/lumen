@@ -3,7 +3,7 @@
 > **IR이 양자화 커널을 자동 합성하는** LLM 추론 컴파일러 + 런타임.
 > 한국어 LLM(EXAONE, HyperCLOVA-X, A.X) 추론도 1급으로 지원.
 
-[![Build](https://img.shields.io/badge/build-WIP-yellow)](#) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#) [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](#)
+[![Build](https://img.shields.io/badge/build-passing-green)](#) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#) [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](#) [![Version](https://img.shields.io/badge/version-v0.1.0-brightgreen)](#)
 
 ---
 
@@ -45,14 +45,23 @@ PyTorch나 ONNX Runtime처럼 기성 그래프 컴파일러를 갖다 쓰는 것
 | 6.A~D. Tokenizer + Transformer | BPE + Llama op + layer forward + KV cache | ✅ 완료 |
 | 6.E. Generate loop | Model + KV cache + autoregressive decode | ✅ 완료 |
 | 6.F. **Real Qwen2.5-0.5B 한국어 추론** | "안녕" → "안녕하세요, 저는" (~0.54s/token) | ✅ **완료** |
+| 6.G. JIT 통합 (lm_head → 전체 forward) | shape-keyed `MatmulJitCache`, 동일 토큰 보장 | ✅ **완료** |
+| 7.A. **vs llama.cpp 벤치** | tg32 단일 스레드: naive 2.91 / JIT 4.43 / ggml 41.32 tok/s | ✅ **완료** |
 | 2.C. ARM64 backend | AAPCS64, NEON-readiness | ⏳ |
 | 3.D. 캐시 타일링 | 블록 매크로커널, 256³+ 큰 사이즈 유지 | ⏳ |
-| 4. JIT 엔진 | 런타임 컴파일 | ⏳ |
-| 5. 양자화 | INT8/INT4, GGUF | ⏳ |
-| 6. LLM 추론 | 토크나이저, KV, sampling | ⏳ |
-| 7. 벤치 · 블로그 | vs llama.cpp | ⏳ |
+| 5.C+. Q8×F32 fused matmul (model path) | dequant 패스 우회, 메모리 대역 회복 | ⏳ |
 
-상세 계획: [PLAN.md](./PLAN.md) · 아키텍처: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
+상세 계획: [PLAN.md](./PLAN.md) · 아키텍처: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) · 벤치: [BENCHMARK.md](./BENCHMARK.md)
+
+## 현재 성능 (v0.1.0, Qwen2.5-0.5B Q8_0, 1 thread)
+
+| 경로 | tg32 tok/s | vs llama.cpp |
+|---|---:|---:|
+| Lumen naive Rust | 2.91 | 14.2× slower |
+| **Lumen JIT (4×8 tile / 1×8 AVX2)** | **4.43** | **9.3× slower** |
+| llama.cpp (ggml, b9174 AVX2) | 41.32 | 1.0× |
+
+JIT는 naive 대비 1.52× 빠릅니다. ggml과의 9.3× 격차는 정직하게 인정하고, 어디서 줄어들지 [BENCHMARK.md](./BENCHMARK.md)에 적었습니다 (Q8-native matmul, 캐시 블로킹, flash-style attention, AVX-512, 멀티스레드).
 
 ## Quick start
 
