@@ -672,6 +672,218 @@ pub fn forward_layer_decode_jit(
     resid
 }
 
+/// Per-step time accumulator for profiling the JIT decode path.
+///
+/// Phase 7.E.0 scope: figure out where decode time actually goes before we
+/// commit to flash attention vs multi-thread vs anything else. Sum every
+/// per-step elapsed time across many decode tokens, then print a sorted
+/// breakdown.
+#[derive(Default, Debug, Clone)]
+pub struct StepTimer {
+    pub embed: std::time::Duration,
+    pub layer_attn_rms: std::time::Duration,
+    pub layer_qkv_matmul: std::time::Duration,
+    pub layer_qkv_bias: std::time::Duration,
+    pub layer_rope: std::time::Duration,
+    pub layer_kv_append: std::time::Duration,
+    pub layer_attention: std::time::Duration,
+    pub layer_wo_matmul: std::time::Duration,
+    pub layer_attn_residual: std::time::Duration,
+    pub layer_ffn_rms: std::time::Duration,
+    pub layer_gate_up_matmul: std::time::Duration,
+    pub layer_silu_mul: std::time::Duration,
+    pub layer_down_matmul: std::time::Duration,
+    pub layer_ffn_residual: std::time::Duration,
+    pub final_rms: std::time::Duration,
+    pub lm_head_matmul: std::time::Duration,
+}
+
+impl StepTimer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sum of every recorded bucket — should approximate one full forward
+    /// (minus the trivial argmax that lives in the generate loop).
+    pub fn total(&self) -> std::time::Duration {
+        self.embed
+            + self.layer_attn_rms
+            + self.layer_qkv_matmul
+            + self.layer_qkv_bias
+            + self.layer_rope
+            + self.layer_kv_append
+            + self.layer_attention
+            + self.layer_wo_matmul
+            + self.layer_attn_residual
+            + self.layer_ffn_rms
+            + self.layer_gate_up_matmul
+            + self.layer_silu_mul
+            + self.layer_down_matmul
+            + self.layer_ffn_residual
+            + self.final_rms
+            + self.lm_head_matmul
+    }
+
+    /// Pretty-print breakdown, sorted by share of total descending.
+    pub fn report(&self, label: &str) -> String {
+        let total = self.total();
+        let total_ns = total.as_nanos().max(1);
+        let mut rows: Vec<(&str, std::time::Duration)> = vec![
+            ("embed", self.embed),
+            ("layer/attn_rms", self.layer_attn_rms),
+            ("layer/qkv_matmul", self.layer_qkv_matmul),
+            ("layer/qkv_bias", self.layer_qkv_bias),
+            ("layer/rope", self.layer_rope),
+            ("layer/kv_append", self.layer_kv_append),
+            ("layer/attention", self.layer_attention),
+            ("layer/wo_matmul", self.layer_wo_matmul),
+            ("layer/attn_residual", self.layer_attn_residual),
+            ("layer/ffn_rms", self.layer_ffn_rms),
+            ("layer/gate_up_matmul", self.layer_gate_up_matmul),
+            ("layer/silu_mul", self.layer_silu_mul),
+            ("layer/down_matmul", self.layer_down_matmul),
+            ("layer/ffn_residual", self.layer_ffn_residual),
+            ("final_rms", self.final_rms),
+            ("lm_head_matmul", self.lm_head_matmul),
+        ];
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1));
+        let mut s = format!("{} (total {:?}):\n", label, total);
+        for (name, d) in rows {
+            let pct = (d.as_nanos() as f64 / total_ns as f64) * 100.0;
+            s.push_str(&format!("  {:>22}  {:>10?}  {:>5.1}%\n", name, d, pct));
+        }
+        s
+    }
+}
+
+/// Profiled variant of [`forward_layer_decode_jit`]: same semantics, but every
+/// step's elapsed time is added to the shared `timer`. Used by Phase 7.E.0
+/// profiling. Adds ~20 `Instant::now()` calls per layer per token — small
+/// enough not to distort the picture meaningfully.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_layer_decode_jit_timed(
+    x_t: &[f32],
+    position: u32,
+    layer: &LayerWeights,
+    cache: &mut LayerKvCache,
+    cfg: &LayerConfig,
+    jit: &mut MatmulJitCache,
+    timer: &mut StepTimer,
+) -> Vec<f32> {
+    use std::time::Instant;
+
+    // 1. attention RMSNorm
+    let t = Instant::now();
+    let mut x_norm = vec![0.0f32; cfg.hidden];
+    rms_norm(
+        x_t,
+        &layer.attn_norm_w,
+        &mut x_norm,
+        cfg.hidden,
+        cfg.rms_norm_eps,
+    );
+    timer.layer_attn_rms += t.elapsed();
+
+    // 2. Q/K/V projection.
+    let t = Instant::now();
+    let mut q = weight_matmul_jit_storage(&x_norm, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
+    let mut k = weight_matmul_jit_storage(&x_norm, &layer.wk, cfg.hidden, cfg.kv_dim(), jit);
+    let mut v = weight_matmul_jit_storage(&x_norm, &layer.wv, cfg.hidden, cfg.kv_dim(), jit);
+    timer.layer_qkv_matmul += t.elapsed();
+
+    let t = Instant::now();
+    if let Some(b) = &layer.b_q {
+        add_bias_broadcast(&mut q, b, cfg.q_dim());
+    }
+    if let Some(b) = &layer.b_k {
+        add_bias_broadcast(&mut k, b, cfg.kv_dim());
+    }
+    if let Some(b) = &layer.b_v {
+        add_bias_broadcast(&mut v, b, cfg.kv_dim());
+    }
+    timer.layer_qkv_bias += t.elapsed();
+
+    // 3. RoPE
+    let t = Instant::now();
+    rope_in_place(
+        &mut q,
+        &[position],
+        cfg.n_heads,
+        cfg.head_dim,
+        cfg.rope_base,
+    );
+    rope_in_place(
+        &mut k,
+        &[position],
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        cfg.rope_base,
+    );
+    timer.layer_rope += t.elapsed();
+
+    // 4. Append + attention.
+    let t = Instant::now();
+    cache.append(&k, &v);
+    timer.layer_kv_append += t.elapsed();
+
+    let t = Instant::now();
+    let attn = attention_decode(&q, cache, cfg);
+    timer.layer_attention += t.elapsed();
+
+    // 5. output projection.
+    let t = Instant::now();
+    let attn_out = weight_matmul_jit_storage(&attn, &layer.wo, cfg.q_dim(), cfg.hidden, jit);
+    timer.layer_wo_matmul += t.elapsed();
+
+    // 6. residual.
+    let t = Instant::now();
+    let mut resid: Vec<f32> = x_t
+        .iter()
+        .zip(attn_out.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+    timer.layer_attn_residual += t.elapsed();
+
+    // 7. FFN RMSNorm.
+    let t = Instant::now();
+    let mut ffn_in = vec![0.0f32; cfg.hidden];
+    rms_norm(
+        &resid,
+        &layer.ffn_norm_w,
+        &mut ffn_in,
+        cfg.hidden,
+        cfg.rms_norm_eps,
+    );
+    timer.layer_ffn_rms += t.elapsed();
+
+    // 8. gate/up.
+    let t = Instant::now();
+    let mut gate =
+        weight_matmul_jit_storage(&ffn_in, &layer.w_gate, cfg.hidden, cfg.ffn_hidden, jit);
+    let up = weight_matmul_jit_storage(&ffn_in, &layer.w_up, cfg.hidden, cfg.ffn_hidden, jit);
+    timer.layer_gate_up_matmul += t.elapsed();
+
+    // 9. SiLU(gate) * up.
+    let t = Instant::now();
+    silu_in_place(&mut gate);
+    mul_in_place(&mut gate, &up);
+    timer.layer_silu_mul += t.elapsed();
+
+    // 10. down.
+    let t = Instant::now();
+    let ffn_out = weight_matmul_jit_storage(&gate, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit);
+    timer.layer_down_matmul += t.elapsed();
+
+    // 11. residual.
+    let t = Instant::now();
+    for (r, o) in resid.iter_mut().zip(ffn_out.iter()) {
+        *r += *o;
+    }
+    timer.layer_ffn_residual += t.elapsed();
+
+    resid
+}
+
 /// Top-level model hyperparameters: a `LayerConfig` plus vocab and depth.
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -800,6 +1012,96 @@ impl Model {
             self.config.vocab_size,
             jit,
         )
+    }
+
+    /// Profiled variant of [`Self::forward_decode_jit`] — adds each step's
+    /// elapsed time to `timer`. Phase 7.E.0 only; not on the production path.
+    pub fn forward_decode_jit_timed(
+        &self,
+        token: u32,
+        position: u32,
+        cache: &mut KvCache,
+        jit: &mut MatmulJitCache,
+        timer: &mut StepTimer,
+    ) -> Vec<f32> {
+        use std::time::Instant;
+        assert_eq!(cache.n_layers(), self.config.n_layers);
+
+        let t = Instant::now();
+        let mut x = self.embed_token(token);
+        timer.embed += t.elapsed();
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = forward_layer_decode_jit_timed(
+                &x,
+                position,
+                layer,
+                cache.layer_mut(i),
+                &self.config.layer,
+                jit,
+                timer,
+            );
+        }
+
+        let t = Instant::now();
+        let mut x_norm = vec![0.0f32; self.config.hidden()];
+        rms_norm(
+            &x,
+            &self.final_norm_w,
+            &mut x_norm,
+            self.config.hidden(),
+            self.config.layer.rms_norm_eps,
+        );
+        timer.final_rms += t.elapsed();
+
+        let t = Instant::now();
+        let logits = weight_matmul_jit_storage(
+            &x_norm,
+            &self.lm_head_w,
+            self.config.hidden(),
+            self.config.vocab_size,
+            jit,
+        );
+        timer.lm_head_matmul += t.elapsed();
+        logits
+    }
+
+    /// Profiled variant of [`Self::generate_greedy_jit`]: returns both the
+    /// generated tokens and the per-step time accumulator.
+    pub fn generate_greedy_jit_timed(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+    ) -> (Vec<u32>, StepTimer) {
+        assert!(!prompt.is_empty());
+        assert!(prompt.len() + max_new <= self.config.max_seq);
+
+        let mut cache = KvCache::new(
+            self.config.n_layers,
+            prompt.len() + max_new,
+            self.config.layer.kv_dim(),
+        );
+        let mut jit = MatmulJitCache::new();
+        let mut timer = StepTimer::new();
+
+        let mut last_logits = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            last_logits =
+                self.forward_decode_jit_timed(tok, pos as u32, &mut cache, &mut jit, &mut timer);
+        }
+
+        let mut out = Vec::with_capacity(max_new);
+        for i in 0..max_new {
+            let next = argmax(&last_logits) as u32;
+            out.push(next);
+            if Some(next) == self.config.eos_token_id {
+                break;
+            }
+            let next_pos = (prompt.len() + i) as u32;
+            last_logits =
+                self.forward_decode_jit_timed(next, next_pos, &mut cache, &mut jit, &mut timer);
+        }
+        (out, timer)
     }
 
     /// JIT variant of [`Self::generate_greedy`]. Caller must have called

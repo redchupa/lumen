@@ -13,7 +13,7 @@ pub mod tensor;
 pub use kvcache::{KvCache, LayerKvCache};
 pub use model::{
     forward_layer, forward_layer_decode, multi_head_attention, LayerConfig, LayerWeights, Model,
-    ModelConfig, WeightStorage,
+    ModelConfig, StepTimer, WeightStorage,
 };
 pub use ops::{mul_in_place, rms_norm, rope_in_place, silu_in_place, softmax_rows};
 

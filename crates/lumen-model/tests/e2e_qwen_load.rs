@@ -225,6 +225,33 @@ fn transpose_n_k_to_k_n(src: &[f32], n: usize, k: usize) -> Vec<f32> {
     out
 }
 
+/// Phase 7.E.0: profile where decode time actually goes per step. Runs the
+/// same 32-token decode as `qwen_bench_tg32_jit` but through the timed
+/// variant so we can decide whether the next 2× win lives in attention
+/// (flash-style), in matmul micro-tuning, in multi-thread, or somewhere we
+/// haven't named yet.
+#[test]
+#[ignore = "loads ~640MB; ~2s in release; for profiling only"]
+fn qwen_profile_tg32_jit() {
+    if !check_qwen_present() {
+        eprintln!("skip: {} not present", QWEN_PATH);
+        return;
+    }
+    let file = GgufFile::open(QWEN_PATH).expect("open gguf");
+    let mut model = model_from_gguf(&file, "qwen2").expect("model");
+    let tok = Tokenizer::from_gguf(&file).expect("tokenizer");
+    model.transpose_for_jit();
+
+    let prompt_ids = tok.encode("안녕");
+    let max_new = 32usize;
+
+    let (new_ids, timer) = model.generate_greedy_jit_timed(&prompt_ids, max_new);
+    eprintln!("generated {} tokens", new_ids.len());
+    eprintln!("{}", timer.report("tg32 step breakdown"));
+
+    assert_eq!(new_ids.len(), max_new);
+}
+
 /// Phase 7.A bench (naive): same 32-token decode through the in-tree naive
 /// matmul. Reference for "how much did JIT help" and the comparison row vs
 /// llama.cpp.
