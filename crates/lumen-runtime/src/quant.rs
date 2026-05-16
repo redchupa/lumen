@@ -50,7 +50,7 @@ const _: () = {
 
 /// 34-byte Q8_0 block. Packed for ggml byte compatibility.
 #[repr(C, packed)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BlockQ8_0 {
     pub d: u16,
     pub qs: [i8; 32],

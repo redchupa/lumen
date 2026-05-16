@@ -24,14 +24,26 @@ and microkernel tuning. The gap is meaningful and we own it.
 |---|---:|---:|
 | Lumen naive Rust matmul | 2.91 | 14.2× slower |
 | Lumen JIT (4×8 tile / 1×8 AVX2, 1-acc) | 4.43 | 9.3× slower |
-| **Lumen JIT (+ 1×N 4-acc decode path, Phase 7.C)** | **5.08** | **8.1× slower** |
+| Lumen JIT (+ 1×N 4-acc decode path, Phase 7.C) | 5.08 | 8.1× slower |
+| **Lumen JIT (+ Q8-native fused matmul, Phase 7.D)** | **17.97** | **2.30× slower** |
 | llama.cpp (ggml) | 41.32 | 1.0× |
 
-The 4.43 → 5.08 jump (**+14.7%**) comes from breaking the 1-accumulator
-FMA dependency chain that bound the M=1 decode matmul path. The dispatcher
-now routes `M=1, N % 32 == 0` shapes — every weight matmul in
-autoregressive decode — to a 4-accumulator 1×32 stride kernel. Tokens
-remain bit-identical to the naive path.
+The 5.08 → 17.97 jump (**+3.5×, +254% vs the original 4.43**) comes from
+keeping Q8_0 weights in their native layout end-to-end instead of
+dequantizing to F32 at load time:
+
+- weights stay 1× as many bytes (Q8: 1.0625 B/elt vs F32: 4 B/elt) — 4×
+  the cache footprint freed
+- the per-matmul fp32 dequant pass is gone
+- a new decode kernel (`emit_quant_matmul_q8_n1_body`) reads Q8 blocks,
+  rescales by the per-block fp16 `d`, and multiplies through F32
+  activations in K-direction SIMD with a horizontal reduction tail
+- `transpose_for_jit` drops from 1.94s to 700ns — the F32 weights that
+  needed transposing are now Q8 weights that don't
+
+Tokens remain bit-identical to the naive path (the new path is
+mathematically equivalent to dequant-then-matmul; the fp32 dequant just
+happens implicitly inside the inner loop).
 
 llama.cpp also reports a `pp128 = 160.82 tok/s` for prompt processing
 (batched 128 tokens). Lumen has no batched prefill yet — every prompt

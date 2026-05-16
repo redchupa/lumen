@@ -28,7 +28,7 @@
 use lumen_runtime::quant::{
     dequantize_q4_0, dequantize_q8_0, f16_bits_to_f32, BlockQ4_0, BlockQ8_0, QK,
 };
-use lumen_runtime::{LayerConfig, LayerWeights, Model, ModelConfig};
+use lumen_runtime::{LayerConfig, LayerWeights, Model, ModelConfig, WeightStorage};
 
 use crate::gguf::{GgmlType, GgufError, GgufFile, KvValue};
 
@@ -123,6 +123,31 @@ fn get_u32_optional(file: &GgufFile, key: &str) -> Option<u32> {
     get_u32(file, key).ok()
 }
 
+/// Load a tensor into [`WeightStorage`], preserving Q8_0 weights in their
+/// native ggml block layout for the fused Q8×F32 JIT kernel. Non-Q8 tensors
+/// fall through to F32 (via [`tensor_to_f32`]).
+fn tensor_to_storage(file: &GgufFile, name: &str) -> Result<WeightStorage, GgufError> {
+    let info = file
+        .tensor(name)
+        .ok_or_else(|| GgufError::NoSuchTensor(name.to_string()))?;
+    if info.dtype == GgmlType::Q8_0 {
+        let bytes = file.tensor_data(name)?;
+        debug_assert_eq!(bytes.len() % 34, 0);
+        let n_blocks = bytes.len() / 34;
+        let nelem = info.element_count() as usize;
+        debug_assert_eq!(nelem, n_blocks * QK);
+        // SAFETY: `BlockQ8_0` is `repr(C, packed)` 34 bytes; the GGUF payload
+        // is a contiguous run of those same blocks. We copy them into an
+        // owned Vec so the resulting `WeightStorage::Q8` is independent of
+        // the mmapped file lifetime.
+        let blocks: &[BlockQ8_0] =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const BlockQ8_0, n_blocks) };
+        return Ok(WeightStorage::Q8(blocks.to_vec()));
+    }
+    let f32_buf = tensor_to_f32(file, name)?;
+    Ok(WeightStorage::F32(f32_buf))
+}
+
 /// Read architecture hyperparameters from GGUF metadata. `arch` is the prefix
 /// used by this model (e.g. "llama", "qwen2", "lumen.test").
 pub fn config_from_gguf(file: &GgufFile, arch: &str) -> Result<ModelConfig, GgufError> {
@@ -180,9 +205,11 @@ pub fn model_from_gguf(file: &GgufFile, arch: &str) -> Result<Model, GgufError> 
 
     let token_embeddings = tensor_to_f32(file, "token_embd.weight")?;
     let final_norm_w = tensor_to_f32(file, "output_norm.weight")?;
-    let lm_head_w = match tensor_to_f32(file, "output.weight") {
-        Ok(v) => v,
-        Err(GgufError::NoSuchTensor(_)) => token_embeddings.clone(), // weight tying
+    // lm_head: keep Q8 native if the GGUF stores it that way; fall back to
+    // weight-tied F32 embeddings if `output.weight` isn't present at all.
+    let lm_head_w = match tensor_to_storage(file, "output.weight") {
+        Ok(s) => s,
+        Err(GgufError::NoSuchTensor(_)) => WeightStorage::F32(token_embeddings.clone()),
         Err(e) => return Err(e),
     };
 
@@ -199,14 +226,14 @@ pub fn model_from_gguf(file: &GgufFile, arch: &str) -> Result<Model, GgufError> 
         };
         layers.push(LayerWeights {
             attn_norm_w: tensor_to_f32(file, &format!("{}.attn_norm.weight", p))?,
-            wq: tensor_to_f32(file, &format!("{}.attn_q.weight", p))?,
-            wk: tensor_to_f32(file, &format!("{}.attn_k.weight", p))?,
-            wv: tensor_to_f32(file, &format!("{}.attn_v.weight", p))?,
-            wo: tensor_to_f32(file, &format!("{}.attn_output.weight", p))?,
+            wq: tensor_to_storage(file, &format!("{}.attn_q.weight", p))?,
+            wk: tensor_to_storage(file, &format!("{}.attn_k.weight", p))?,
+            wv: tensor_to_storage(file, &format!("{}.attn_v.weight", p))?,
+            wo: tensor_to_storage(file, &format!("{}.attn_output.weight", p))?,
             ffn_norm_w: tensor_to_f32(file, &format!("{}.ffn_norm.weight", p))?,
-            w_gate: tensor_to_f32(file, &format!("{}.ffn_gate.weight", p))?,
-            w_up: tensor_to_f32(file, &format!("{}.ffn_up.weight", p))?,
-            w_down: tensor_to_f32(file, &format!("{}.ffn_down.weight", p))?,
+            w_gate: tensor_to_storage(file, &format!("{}.ffn_gate.weight", p))?,
+            w_up: tensor_to_storage(file, &format!("{}.ffn_up.weight", p))?,
+            w_down: tensor_to_storage(file, &format!("{}.ffn_down.weight", p))?,
             b_q: optional_bias(&format!("{}.attn_q.bias", p)),
             b_k: optional_bias(&format!("{}.attn_k.bias", p)),
             b_v: optional_bias(&format!("{}.attn_v.bias", p)),

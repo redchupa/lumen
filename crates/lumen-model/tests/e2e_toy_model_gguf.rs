@@ -10,7 +10,17 @@
 //! follow in Phase 6.F.2.
 
 use lumen_model::{config_from_gguf, gguf::KvType, model_from_gguf, GgmlType, GgufFile};
-use lumen_runtime::{LayerConfig, LayerWeights, Model, ModelConfig};
+use lumen_runtime::{LayerConfig, LayerWeights, Model, ModelConfig, WeightStorage};
+
+/// Tests in this file build models with only `WeightStorage::F32`; this helper
+/// unwraps the inner buffer for tensor serialization. Panics on Q8 — which
+/// would mean a test was changed without updating its writer path.
+fn f32_buf(s: &WeightStorage) -> Vec<f32> {
+    match s {
+        WeightStorage::F32(v) => v.clone(),
+        WeightStorage::Q8(_) => panic!("toy GGUF writer expects F32 storage only"),
+    }
+}
 
 // ----- minimal GGUF writer (test helper) ------------------------------------
 
@@ -74,7 +84,7 @@ fn write_toy_gguf(arch: &str, model: &Model) -> Vec<u8> {
     tensors.push((
         "output.weight".into(),
         vec![h as u64, cfg.vocab_size as u64],
-        model.lm_head_w.clone(),
+        f32_buf(&model.lm_head_w),
     ));
     for (i, layer) in model.layers.iter().enumerate() {
         let p = format!("blk.{}", i);
@@ -86,22 +96,22 @@ fn write_toy_gguf(arch: &str, model: &Model) -> Vec<u8> {
         tensors.push((
             format!("{}.attn_q.weight", p),
             vec![h as u64, qd as u64],
-            layer.wq.clone(),
+            f32_buf(&layer.wq),
         ));
         tensors.push((
             format!("{}.attn_k.weight", p),
             vec![h as u64, kvd as u64],
-            layer.wk.clone(),
+            f32_buf(&layer.wk),
         ));
         tensors.push((
             format!("{}.attn_v.weight", p),
             vec![h as u64, kvd as u64],
-            layer.wv.clone(),
+            f32_buf(&layer.wv),
         ));
         tensors.push((
             format!("{}.attn_output.weight", p),
             vec![qd as u64, h as u64],
-            layer.wo.clone(),
+            f32_buf(&layer.wo),
         ));
         tensors.push((
             format!("{}.ffn_norm.weight", p),
@@ -111,17 +121,17 @@ fn write_toy_gguf(arch: &str, model: &Model) -> Vec<u8> {
         tensors.push((
             format!("{}.ffn_gate.weight", p),
             vec![h as u64, ff as u64],
-            layer.w_gate.clone(),
+            f32_buf(&layer.w_gate),
         ));
         tensors.push((
             format!("{}.ffn_up.weight", p),
             vec![h as u64, ff as u64],
-            layer.w_up.clone(),
+            f32_buf(&layer.w_up),
         ));
         tensors.push((
             format!("{}.ffn_down.weight", p),
             vec![ff as u64, h as u64],
-            layer.w_down.clone(),
+            f32_buf(&layer.w_down),
         ));
     }
 
@@ -226,18 +236,19 @@ fn small_random_model(seed: u64) -> Model {
     let ff = lcfg.ffn_hidden;
     let mk_vec =
         |gen: &mut dyn FnMut() -> f32, n: usize| -> Vec<f32> { (0..n).map(|_| gen()).collect() };
+    let mks = |gen: &mut dyn FnMut() -> f32, n: usize| WeightStorage::F32(mk_vec(gen, n));
     let mut layers = Vec::new();
     for _ in 0..cfg.n_layers {
         layers.push(LayerWeights {
             attn_norm_w: vec![1.0; h],
-            wq: mk_vec(&mut next, qd * h),
-            wk: mk_vec(&mut next, kvd * h),
-            wv: mk_vec(&mut next, kvd * h),
-            wo: mk_vec(&mut next, h * qd),
+            wq: mks(&mut next, qd * h),
+            wk: mks(&mut next, kvd * h),
+            wv: mks(&mut next, kvd * h),
+            wo: mks(&mut next, h * qd),
             ffn_norm_w: vec![1.0; h],
-            w_gate: mk_vec(&mut next, ff * h),
-            w_up: mk_vec(&mut next, ff * h),
-            w_down: mk_vec(&mut next, h * ff),
+            w_gate: mks(&mut next, ff * h),
+            w_up: mks(&mut next, ff * h),
+            w_down: mks(&mut next, h * ff),
             b_q: None,
             b_k: None,
             b_v: None,
@@ -247,7 +258,7 @@ fn small_random_model(seed: u64) -> Model {
         token_embeddings: mk_vec(&mut next, cfg.vocab_size * h),
         layers,
         final_norm_w: vec![1.0; h],
-        lm_head_w: mk_vec(&mut next, cfg.vocab_size * h),
+        lm_head_w: WeightStorage::F32(mk_vec(&mut next, cfg.vocab_size * h)),
         config: cfg,
     }
 }

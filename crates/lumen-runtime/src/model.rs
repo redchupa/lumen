@@ -15,7 +15,9 @@
 
 use crate::kvcache::LayerKvCache;
 use crate::ops::{mul_in_place, rms_norm, rope_in_place, silu_in_place, softmax_rows};
+use crate::quant::{dequantize_q8_0, BlockQ8_0, QK};
 use lumen_jit::MatmulJitCache;
+use std::borrow::Cow;
 
 /// Architecture hyperparameters for one Llama-family transformer.
 #[derive(Clone, Debug)]
@@ -42,25 +44,69 @@ impl LayerConfig {
     }
 }
 
+/// Storage for one large projection weight.
+///
+/// The naive forward path always sees `[d_out, d_in]` row-major. The JIT
+/// path's F32 kernels need `[d_in, d_out]` so [`LayerWeights::transpose_in_place`]
+/// flips the F32 variant. The Q8 variant is consumed by the fused Q8×F32
+/// kernel, which reads weights in their native `[d_out, d_in]` ggml layout
+/// and therefore never needs transposing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WeightStorage {
+    /// F32 weights. Layout is `[d_out, d_in]` until `transpose_in_place` runs,
+    /// then `[d_in, d_out]`.
+    F32(Vec<f32>),
+    /// Q8_0 weights packed as native ggml `[d_out, d_in]` blocks (one block
+    /// covers 32 contiguous d_in elements within a row).
+    Q8(Vec<BlockQ8_0>),
+}
+
+impl WeightStorage {
+    /// Total number of f32 elements this weight represents (matches what
+    /// `as_f32_native` would yield).
+    pub fn nelem(&self) -> usize {
+        match self {
+            WeightStorage::F32(v) => v.len(),
+            WeightStorage::Q8(blocks) => blocks.len() * QK,
+        }
+    }
+
+    /// Return the weight as F32 in `[d_out, d_in]` layout for the naive path.
+    /// Borrows the F32 case zero-copy; allocates and dequantizes for Q8.
+    /// Only valid before `transpose_in_place` has been called.
+    pub fn as_f32_native(&self, d_out: usize, d_in: usize) -> Cow<'_, [f32]> {
+        match self {
+            WeightStorage::F32(v) => {
+                debug_assert_eq!(v.len(), d_out * d_in);
+                Cow::Borrowed(v)
+            }
+            WeightStorage::Q8(blocks) => {
+                debug_assert_eq!(blocks.len() * QK, d_out * d_in);
+                let mut out = vec![0.0f32; d_out * d_in];
+                dequantize_q8_0(blocks, &mut out);
+                Cow::Owned(out)
+            }
+        }
+    }
+}
+
 /// All the learned weights one transformer layer needs.
 ///
-/// Layout convention: row-major. For a weight `W` that turns an input of
-/// dim `D_in` into an output of dim `D_out`, we store it as `[D_out, D_in]`
-/// (one output row per matmul output element). This matches what
-/// `matmul(activation [_, D_in], W^T [D_in, D_out])` consumes when we
-/// call into the native backend, which expects `A @ B` with shapes
-/// `[M, K] @ [K, N]`.
+/// Layout convention for the seven large projections: row-major. For a weight
+/// `W` that turns an input of dim `D_in` into an output of dim `D_out`, the
+/// natural ggml layout is `[D_out, D_in]`. F32 storage may be transposed
+/// in-place to `[D_in, D_out]` for the JIT path; Q8 storage stays native.
 #[derive(Clone, Debug)]
 pub struct LayerWeights {
     pub attn_norm_w: Vec<f32>, // [hidden]
-    pub wq: Vec<f32>,          // [q_dim, hidden] flattened
-    pub wk: Vec<f32>,          // [kv_dim, hidden]
-    pub wv: Vec<f32>,          // [kv_dim, hidden]
-    pub wo: Vec<f32>,          // [hidden, q_dim]
+    pub wq: WeightStorage,     // [q_dim, hidden]
+    pub wk: WeightStorage,     // [kv_dim, hidden]
+    pub wv: WeightStorage,     // [kv_dim, hidden]
+    pub wo: WeightStorage,     // [hidden, q_dim]
     pub ffn_norm_w: Vec<f32>,  // [hidden]
-    pub w_gate: Vec<f32>,      // [ffn_hidden, hidden]
-    pub w_up: Vec<f32>,        // [ffn_hidden, hidden]
-    pub w_down: Vec<f32>,      // [hidden, ffn_hidden]
+    pub w_gate: WeightStorage, // [ffn_hidden, hidden]
+    pub w_up: WeightStorage,   // [ffn_hidden, hidden]
+    pub w_down: WeightStorage, // [hidden, ffn_hidden]
     // Qwen2-style attention biases (Llama2/Llama3 omit these → `None`).
     pub b_q: Option<Vec<f32>>, // [q_dim]
     pub b_k: Option<Vec<f32>>, // [kv_dim]
@@ -82,25 +128,32 @@ pub fn transpose_2d(src: &[f32], d_out: usize, d_in: usize) -> Vec<f32> {
 }
 
 impl LayerWeights {
-    /// Transpose every weight matrix from `[d_out, d_in]` (ggml convention)
+    /// Transpose every F32 weight matrix from `[d_out, d_in]` (ggml convention)
     /// into `[d_in, d_out]` (the layout the JIT matmul kernels expect for
-    /// their `B` operand). After calling this, the layer is *only* usable
-    /// via the `_jit` forward functions.
-    ///
-    /// Peak extra memory during the call is one weight matrix's worth — the
-    /// old buffer is dropped as soon as the transpose finishes.
+    /// their `B` operand). Q8 weights are left untouched — the fused Q8×F32
+    /// kernel consumes them in their native `[d_out, d_in]` layout. After
+    /// calling this, the F32 weights are *only* usable via the `_jit` forward
+    /// functions.
     pub fn transpose_in_place(&mut self, cfg: &LayerConfig) {
         let h = cfg.hidden;
         let qd = cfg.q_dim();
         let kvd = cfg.kv_dim();
         let ff = cfg.ffn_hidden;
-        self.wq = transpose_2d(&self.wq, qd, h);
-        self.wk = transpose_2d(&self.wk, kvd, h);
-        self.wv = transpose_2d(&self.wv, kvd, h);
-        self.wo = transpose_2d(&self.wo, h, qd);
-        self.w_gate = transpose_2d(&self.w_gate, ff, h);
-        self.w_up = transpose_2d(&self.w_up, ff, h);
-        self.w_down = transpose_2d(&self.w_down, h, ff);
+        transpose_storage_in_place(&mut self.wq, qd, h);
+        transpose_storage_in_place(&mut self.wk, kvd, h);
+        transpose_storage_in_place(&mut self.wv, kvd, h);
+        transpose_storage_in_place(&mut self.wo, h, qd);
+        transpose_storage_in_place(&mut self.w_gate, ff, h);
+        transpose_storage_in_place(&mut self.w_up, ff, h);
+        transpose_storage_in_place(&mut self.w_down, h, ff);
+    }
+}
+
+/// Transpose just the F32 case in place. Q8 is a no-op (native layout already
+/// matches what the fused kernel wants).
+fn transpose_storage_in_place(w: &mut WeightStorage, d_out: usize, d_in: usize) {
+    if let WeightStorage::F32(v) = w {
+        *v = transpose_2d(v, d_out, d_in);
     }
 }
 
@@ -121,6 +174,48 @@ fn weight_matmul_jit(
     // SAFETY: cache returned a kernel compiled for exactly (rows, d_in, d_out).
     unsafe {
         f(a.as_ptr(), w_t.as_ptr(), out.as_mut_ptr());
+    }
+    out
+}
+
+/// JIT-backed matmul that dispatches per [`WeightStorage`] variant. Only
+/// supports `rows == 1` (decode); we have no native Q8 path for rows > 1 yet.
+///
+/// For `WeightStorage::F32`, calls into the existing fp32 kernel cache assuming
+/// the F32 buffer has been transposed to `[d_in, d_out]` by `transpose_in_place`.
+///
+/// For `WeightStorage::Q8`, calls into the fused Q8×F32 N=1 kernel which
+/// reads weights in their native `[d_out, d_in]` ggml layout — no transpose,
+/// no dequant pass, no extra fp32 buffer.
+fn weight_matmul_jit_storage(
+    a: &[f32],
+    w: &WeightStorage,
+    d_in: usize,
+    d_out: usize,
+    jit: &mut MatmulJitCache,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; d_out];
+    match w {
+        WeightStorage::F32(buf) => {
+            let f = jit
+                .get_or_compile(1, d_in as u32, d_out as u32)
+                .expect("f32 matmul JIT compile");
+            // SAFETY: cache returned a kernel compiled for (1, d_in, d_out).
+            unsafe {
+                f(a.as_ptr(), buf.as_ptr(), out.as_mut_ptr());
+            }
+        }
+        WeightStorage::Q8(blocks) => {
+            let f = jit
+                .get_or_compile_q8(d_out as u32, d_in as u32, 1)
+                .expect("q8 matmul JIT compile");
+            // SAFETY: cache returned a kernel compiled for (d_out, d_in, 1)
+            // expecting weights as Q8_0 blocks and activations as f32. Block
+            // count is d_out * d_in / 32 = blocks.len() (asserted at load).
+            unsafe {
+                f(blocks.as_ptr() as *const u8, a.as_ptr(), out.as_mut_ptr());
+            }
+        }
     }
     out
 }
@@ -251,9 +346,12 @@ pub fn forward_layer(
     );
 
     // --- 2. Q / K / V projection (+ optional Qwen2 biases) ---
-    let mut q = weight_matmul(&x_norm, &layer.wq, seq, cfg.hidden, cfg.q_dim());
-    let mut k = weight_matmul(&x_norm, &layer.wk, seq, cfg.hidden, cfg.kv_dim());
-    let mut v = weight_matmul(&x_norm, &layer.wv, seq, cfg.hidden, cfg.kv_dim());
+    let wq = layer.wq.as_f32_native(cfg.q_dim(), cfg.hidden);
+    let wk = layer.wk.as_f32_native(cfg.kv_dim(), cfg.hidden);
+    let wv = layer.wv.as_f32_native(cfg.kv_dim(), cfg.hidden);
+    let mut q = weight_matmul(&x_norm, &wq, seq, cfg.hidden, cfg.q_dim());
+    let mut k = weight_matmul(&x_norm, &wk, seq, cfg.hidden, cfg.kv_dim());
+    let mut v = weight_matmul(&x_norm, &wv, seq, cfg.hidden, cfg.kv_dim());
     if let Some(b) = &layer.b_q {
         add_bias_broadcast(&mut q, b, cfg.q_dim());
     }
@@ -279,7 +377,8 @@ pub fn forward_layer(
     let attn = multi_head_attention(&q, &k, &v, seq, cfg);
 
     // --- 5. output projection ---
-    let attn_out = weight_matmul(&attn, &layer.wo, seq, cfg.q_dim(), cfg.hidden);
+    let wo = layer.wo.as_f32_native(cfg.hidden, cfg.q_dim());
+    let attn_out = weight_matmul(&attn, &wo, seq, cfg.q_dim(), cfg.hidden);
 
     // --- 6. residual ---
     let mut resid: Vec<f32> = x.iter().zip(attn_out.iter()).map(|(a, b)| a + b).collect();
@@ -295,15 +394,18 @@ pub fn forward_layer(
     );
 
     // --- 8. gate / up projection ---
-    let mut gate = weight_matmul(&ffn_in, &layer.w_gate, seq, cfg.hidden, cfg.ffn_hidden);
-    let up = weight_matmul(&ffn_in, &layer.w_up, seq, cfg.hidden, cfg.ffn_hidden);
+    let w_gate = layer.w_gate.as_f32_native(cfg.ffn_hidden, cfg.hidden);
+    let w_up = layer.w_up.as_f32_native(cfg.ffn_hidden, cfg.hidden);
+    let mut gate = weight_matmul(&ffn_in, &w_gate, seq, cfg.hidden, cfg.ffn_hidden);
+    let up = weight_matmul(&ffn_in, &w_up, seq, cfg.hidden, cfg.ffn_hidden);
 
     // --- 9. SiLU(gate) * up ---
     silu_in_place(&mut gate);
     mul_in_place(&mut gate, &up);
 
     // --- 10. down projection ---
-    let ffn_out = weight_matmul(&gate, &layer.w_down, seq, cfg.ffn_hidden, cfg.hidden);
+    let w_down = layer.w_down.as_f32_native(cfg.hidden, cfg.ffn_hidden);
+    let ffn_out = weight_matmul(&gate, &w_down, seq, cfg.ffn_hidden, cfg.hidden);
 
     // --- 11. residual ---
     for (r, o) in resid.iter_mut().zip(ffn_out.iter()) {
@@ -387,9 +489,12 @@ pub fn forward_layer_decode(
     );
 
     // 2. Q / K / V projection (single row each), plus optional Qwen2 biases.
-    let mut q = weight_matmul(&x_norm, &layer.wq, 1, cfg.hidden, cfg.q_dim());
-    let mut k = weight_matmul(&x_norm, &layer.wk, 1, cfg.hidden, cfg.kv_dim());
-    let mut v = weight_matmul(&x_norm, &layer.wv, 1, cfg.hidden, cfg.kv_dim());
+    let wq = layer.wq.as_f32_native(cfg.q_dim(), cfg.hidden);
+    let wk = layer.wk.as_f32_native(cfg.kv_dim(), cfg.hidden);
+    let wv = layer.wv.as_f32_native(cfg.kv_dim(), cfg.hidden);
+    let mut q = weight_matmul(&x_norm, &wq, 1, cfg.hidden, cfg.q_dim());
+    let mut k = weight_matmul(&x_norm, &wk, 1, cfg.hidden, cfg.kv_dim());
+    let mut v = weight_matmul(&x_norm, &wv, 1, cfg.hidden, cfg.kv_dim());
     if let Some(b) = &layer.b_q {
         add_bias_broadcast(&mut q, b, cfg.q_dim());
     }
@@ -423,7 +528,8 @@ pub fn forward_layer_decode(
     let attn = attention_decode(&q, cache, cfg);
 
     // 6. output projection
-    let attn_out = weight_matmul(&attn, &layer.wo, 1, cfg.q_dim(), cfg.hidden);
+    let wo = layer.wo.as_f32_native(cfg.hidden, cfg.q_dim());
+    let attn_out = weight_matmul(&attn, &wo, 1, cfg.q_dim(), cfg.hidden);
 
     // 7. residual
     let mut resid: Vec<f32> = x_t
@@ -443,15 +549,18 @@ pub fn forward_layer_decode(
     );
 
     // 9. gate/up
-    let mut gate = weight_matmul(&ffn_in, &layer.w_gate, 1, cfg.hidden, cfg.ffn_hidden);
-    let up = weight_matmul(&ffn_in, &layer.w_up, 1, cfg.hidden, cfg.ffn_hidden);
+    let w_gate = layer.w_gate.as_f32_native(cfg.ffn_hidden, cfg.hidden);
+    let w_up = layer.w_up.as_f32_native(cfg.ffn_hidden, cfg.hidden);
+    let mut gate = weight_matmul(&ffn_in, &w_gate, 1, cfg.hidden, cfg.ffn_hidden);
+    let up = weight_matmul(&ffn_in, &w_up, 1, cfg.hidden, cfg.ffn_hidden);
 
     // 10. SiLU(gate) * up
     silu_in_place(&mut gate);
     mul_in_place(&mut gate, &up);
 
     // 11. down
-    let ffn_out = weight_matmul(&gate, &layer.w_down, 1, cfg.ffn_hidden, cfg.hidden);
+    let w_down = layer.w_down.as_f32_native(cfg.hidden, cfg.ffn_hidden);
+    let ffn_out = weight_matmul(&gate, &w_down, 1, cfg.ffn_hidden, cfg.hidden);
 
     // 12. residual
     for (r, o) in resid.iter_mut().zip(ffn_out.iter()) {
@@ -488,10 +597,11 @@ pub fn forward_layer_decode_jit(
         cfg.rms_norm_eps,
     );
 
-    // 2. Q/K/V projection through JIT, plus optional biases.
-    let mut q = weight_matmul_jit(&x_norm, &layer.wq, 1, cfg.hidden, cfg.q_dim(), jit);
-    let mut k = weight_matmul_jit(&x_norm, &layer.wk, 1, cfg.hidden, cfg.kv_dim(), jit);
-    let mut v = weight_matmul_jit(&x_norm, &layer.wv, 1, cfg.hidden, cfg.kv_dim(), jit);
+    // 2. Q/K/V projection through JIT (per-weight storage dispatch), plus
+    //    optional biases.
+    let mut q = weight_matmul_jit_storage(&x_norm, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
+    let mut k = weight_matmul_jit_storage(&x_norm, &layer.wk, cfg.hidden, cfg.kv_dim(), jit);
+    let mut v = weight_matmul_jit_storage(&x_norm, &layer.wv, cfg.hidden, cfg.kv_dim(), jit);
     if let Some(b) = &layer.b_q {
         add_bias_broadcast(&mut q, b, cfg.q_dim());
     }
@@ -522,8 +632,9 @@ pub fn forward_layer_decode_jit(
     cache.append(&k, &v);
     let attn = attention_decode(&q, cache, cfg);
 
-    // 5. output projection (wo: was [hidden, q_dim] → transposed to [q_dim, hidden])
-    let attn_out = weight_matmul_jit(&attn, &layer.wo, 1, cfg.q_dim(), cfg.hidden, jit);
+    // 5. output projection (wo: ggml-native [hidden, q_dim]; F32 is transposed
+    //    in place to [q_dim, hidden], Q8 stays native).
+    let attn_out = weight_matmul_jit_storage(&attn, &layer.wo, cfg.q_dim(), cfg.hidden, jit);
 
     // 6. residual
     let mut resid: Vec<f32> = x_t
@@ -543,15 +654,16 @@ pub fn forward_layer_decode_jit(
     );
 
     // 8. gate/up
-    let mut gate = weight_matmul_jit(&ffn_in, &layer.w_gate, 1, cfg.hidden, cfg.ffn_hidden, jit);
-    let up = weight_matmul_jit(&ffn_in, &layer.w_up, 1, cfg.hidden, cfg.ffn_hidden, jit);
+    let mut gate =
+        weight_matmul_jit_storage(&ffn_in, &layer.w_gate, cfg.hidden, cfg.ffn_hidden, jit);
+    let up = weight_matmul_jit_storage(&ffn_in, &layer.w_up, cfg.hidden, cfg.ffn_hidden, jit);
 
     // 9. SiLU(gate) * up
     silu_in_place(&mut gate);
     mul_in_place(&mut gate, &up);
 
     // 10. down
-    let ffn_out = weight_matmul_jit(&gate, &layer.w_down, 1, cfg.ffn_hidden, cfg.hidden, jit);
+    let ffn_out = weight_matmul_jit_storage(&gate, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit);
 
     // 11. residual
     for (r, o) in resid.iter_mut().zip(ffn_out.iter()) {
@@ -591,7 +703,7 @@ pub struct Model {
     pub token_embeddings: Vec<f32>,
     pub layers: Vec<LayerWeights>,
     pub final_norm_w: Vec<f32>,
-    pub lm_head_w: Vec<f32>,
+    pub lm_head_w: WeightStorage,
 }
 
 impl Model {
@@ -620,25 +732,30 @@ impl Model {
             self.config.layer.rms_norm_eps,
         );
         // lm_head projection: [1, hidden] @ [vocab, hidden]^T → [vocab]
+        let lm_head_native = self
+            .lm_head_w
+            .as_f32_native(self.config.vocab_size, self.config.hidden());
         weight_matmul(
             &x_norm,
-            &self.lm_head_w,
+            &lm_head_native,
             1,
             self.config.hidden(),
             self.config.vocab_size,
         )
     }
 
-    /// Transpose every weight matrix in the model so the JIT matmul kernels
-    /// can consume them. After this, only the `*_jit` variants are valid;
-    /// calling `forward_decode` / `generate_greedy` will produce garbage.
+    /// Transpose every F32 weight matrix in the model so the JIT matmul
+    /// kernels can consume them. Q8 weights are left native (the fused
+    /// Q8×F32 kernel already reads `[d_out, d_in]`). After this, the F32
+    /// weights are *only* usable via the `_jit` variants; calling
+    /// `forward_decode` / `generate_greedy` on a transposed F32 model
+    /// produces garbage.
     pub fn transpose_for_jit(&mut self) {
         for layer in &mut self.layers {
             layer.transpose_in_place(&self.config.layer);
         }
-        // lm_head was stored as [vocab, hidden] (ggml); transpose to [hidden, vocab].
-        self.lm_head_w = transpose_2d(
-            &self.lm_head_w,
+        transpose_storage_in_place(
+            &mut self.lm_head_w,
             self.config.vocab_size,
             self.config.hidden(),
         );
@@ -674,11 +791,11 @@ impl Model {
             self.config.hidden(),
             self.config.layer.rms_norm_eps,
         );
-        // lm_head projection through JIT (lm_head_w is now [hidden, vocab]).
-        weight_matmul_jit(
+        // lm_head projection through JIT (F32: [hidden, vocab] post-transpose;
+        // Q8: native [vocab, hidden]). Dispatch handles both.
+        weight_matmul_jit_storage(
             &x_norm,
             &self.lm_head_w,
-            1,
             self.config.hidden(),
             self.config.vocab_size,
             jit,
@@ -799,16 +916,17 @@ mod tests {
         let kvd = cfg.kv_dim();
         let ff = cfg.ffn_hidden;
         let mut mk = |n: usize| -> Vec<f32> { (0..n).map(|_| next()).collect() };
+        let mks = |buf: Vec<f32>| WeightStorage::F32(buf);
         LayerWeights {
             attn_norm_w: vec![1.0; h],
-            wq: mk(qd * h),
-            wk: mk(kvd * h),
-            wv: mk(kvd * h),
-            wo: mk(h * qd),
+            wq: mks(mk(qd * h)),
+            wk: mks(mk(kvd * h)),
+            wv: mks(mk(kvd * h)),
+            wo: mks(mk(h * qd)),
             ffn_norm_w: vec![1.0; h],
-            w_gate: mk(ff * h),
-            w_up: mk(ff * h),
-            w_down: mk(h * ff),
+            w_gate: mks(mk(ff * h)),
+            w_up: mks(mk(ff * h)),
+            w_down: mks(mk(h * ff)),
             b_q: None,
             b_k: None,
             b_v: None,
@@ -964,7 +1082,7 @@ mod tests {
                 .map(|i| random_weights(&layer_cfg, seed + i as u64))
                 .collect(),
             final_norm_w: vec![1.0; h],
-            lm_head_w: (0..vocab * h).map(|_| next()).collect(),
+            lm_head_w: WeightStorage::F32((0..vocab * h).map(|_| next()).collect()),
             config: cfg,
         }
     }

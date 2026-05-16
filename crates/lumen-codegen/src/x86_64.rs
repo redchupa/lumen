@@ -558,9 +558,13 @@ fn emit_function_quant_matmul_q8(
             "Phase 5.C: K must be a multiple of 32 (Q8_0 block size)".into(),
         ));
     }
-    if n % 8 != 0 {
+    // N == 1 is the decode shape (single-token autoregressive): handled by a
+    // specialized K-vectorized + horizontal-reduce kernel.
+    // N % 8 == 0 is the prefill / batched shape: handled by the original 5.C
+    // path that vectorizes over output columns.
+    if n != 1 && n % 8 != 0 {
         return Err(CodegenError::ShapeError(
-            "Phase 5.C: N must be a multiple of 8 (AVX2 row width)".into(),
+            "Phase 5.C: N must be 1 (decode) or a multiple of 8 (prefill)".into(),
         ));
     }
 
@@ -585,7 +589,11 @@ fn emit_function_quant_matmul_q8(
     let p_a = abi.param_reg(a_param);
     let p_out = abi.param_reg(f.params.len() as u32);
 
-    emit_quant_matmul_q8_body(em, p_w, p_a, p_out, m as i32, k as i32, n as i32, abi);
+    if n == 1 {
+        emit_quant_matmul_q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+    } else {
+        emit_quant_matmul_q8_body(em, p_w, p_a, p_out, m as i32, k as i32, n as i32, abi);
+    }
     Ok(())
 }
 
@@ -732,6 +740,141 @@ fn emit_quant_matmul_q8_body(
     patch_rel32(em, jge_i, i_done);
 
     // epilogue
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// Q8 × F32 fused matmul, N=1 specialization for decode.
+///
+/// The 5.C-style 5.C body vectorizes the *output column* with N=8 ymm lanes.
+/// Decode hands us N=1 — there's nothing to vectorize on the output dim, so
+/// we re-derive the SIMD on the *K direction* instead:
+///
+///   for i in 0..M:                              # output row
+///     ymm0 = 0                                  # 8-wide accumulator
+///     for kb in 0..K/32:                        # Q8_0 block index
+///       load fp16 d → broadcast → ymm_d
+///       # 4 unrolled 8-wide iterations over the 32 elements of the block:
+///       for inner in [0, 8, 16, 24]:
+///         vpmovsxbd ymm_w = 8 i8 weights → 8 i32
+///         vcvtdq2ps ymm_w → 8 fp32
+///         vmulps    ymm_w *= ymm_d              # scaled weights
+///         vmovups   ymm_a = 8 activations
+///         vfmadd231ps ymm0 += ymm_w * ymm_a
+///     # horizontal sum ymm0 -> scalar
+///     vhaddps ymm0, ymm0, ymm0   ; pair-reduce within each 128-bit lane
+///     vhaddps ymm0, ymm0, ymm0
+///     vextractf128 xmm1, ymm0, 1 ; high 128 → xmm1[0]
+///     vaddss xmm0, xmm0, xmm1    ; low + high → scalar
+///     movss [out + i*4], xmm0
+///
+/// Compared to 5.C's body for N=8 (its smallest valid N), this kernel does
+/// the same total work per row while doing it in K-direction instead of
+/// N-direction. The win versus the existing model path is *eliminating the
+/// fp32 dequant pass entirely* — weights stay in Q8 form on the matmul hot
+/// path, so we cut memory bandwidth by ~4×.
+#[allow(clippy::too_many_arguments)]
+fn emit_quant_matmul_q8_n1_body(
+    em: &mut Emitter,
+    p_w: Reg,
+    p_a: Reg,
+    p_out: Reg,
+    m: i32,
+    k: i32,
+    abi: Abi,
+) {
+    let k_blocks = k / 32;
+    let row_w_bytes = k_blocks * 34;
+
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_w);
+    mov_rr(em, Reg::R13, p_a);
+    mov_rr(em, Reg::R14, p_out);
+
+    // R15 = i (output row), R11 = kb. R10 = kb*32 (activation row-base index).
+    // RAX = absolute byte offset of current (i, kb) block.
+    xor_rr(em, Reg::R15);
+    let i_loop = em.len();
+    cmp_ri32(em, Reg::R15, m);
+    let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // ymm0 = 0
+    vxorps_zero(em, Ymm(0));
+
+    xor_rr(em, Reg::R11); // kb = 0
+    let kb_loop = em.len();
+    cmp_ri32(em, Reg::R11, k_blocks);
+    let jge_kb = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // RAX = i*row_w_bytes + kb*34
+    mov_rr(em, Reg::RAX, Reg::R15);
+    imul_rri32(em, Reg::RAX, Reg::RAX, row_w_bytes);
+    mov_rr(em, Reg::RDX, Reg::R11);
+    imul_rri32(em, Reg::RDX, Reg::RDX, 34);
+    add_rr(em, Reg::RAX, Reg::RDX);
+
+    // ymm2 = broadcast(fp16_to_fp32(d))
+    vmovd_load(em, Ymm(2), Reg::R12, Some((Reg::RAX, Scale::S1)), 0);
+    vcvtph2ps_xmm(em, Ymm(2), Ymm(2));
+    vbroadcastss_xmm(em, Ymm(2), Ymm(2));
+
+    // R10 = kb * 32 (activation float index for this block)
+    mov_rr(em, Reg::R10, Reg::R11);
+    imul_rri32(em, Reg::R10, Reg::R10, 32);
+
+    // 4 unrolled 8-wide chunks across the 32-element Q8_0 block.
+    for inner in [0i32, 8, 16, 24] {
+        // ymm3 = sign-ext 8 bytes -> 8 i32 from [r12 + rax + 2 + inner]
+        vpmovsxbd_load(em, Ymm(3), Reg::R12, Some((Reg::RAX, Scale::S1)), 2 + inner);
+        // ymm3 = i32→f32
+        vcvtdq2ps(em, Ymm(3), Ymm(3));
+        // ymm3 *= ymm2 (broadcast d)
+        vmulps_reg(em, Ymm(3), Ymm(3), Ymm(2));
+        // ymm4 = 8 activations from [r13 + (kb*32 + inner)*4]
+        vmovups_load(em, Ymm(4), Reg::R13, Some((Reg::R10, Scale::S4)), inner * 4);
+        // ymm0 += ymm3 * ymm4
+        vfmadd231ps_reg(em, Ymm(0), Ymm(3), Ymm(4));
+    }
+
+    inc_r(em, Reg::R11);
+    let jmp_kb = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_kb, kb_loop);
+
+    let kb_done = em.len();
+    patch_rel32(em, jge_kb, kb_done);
+
+    // Horizontal reduce ymm0 (8 fp32 lanes) -> scalar in xmm0[0].
+    // Step 1: pair-reduce within each 128-bit lane (twice gets us 4-lane → 1-lane within lane).
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    // Step 2: extract high 128 -> xmm1, then add to xmm0.
+    vextractf128_xmm(em, Ymm(1), Ymm(0), 1);
+    vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
+
+    // movss [r14 + r15*4], xmm0
+    movss_store(em, Xmm(0), Reg::R14, Some((Reg::R15, Scale::S4)), 0);
+
+    inc_r(em, Reg::R15);
+    let jmp_i = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_i, i_loop);
+
+    let i_done = em.len();
+    patch_rel32(em, jge_i, i_done);
+
+    // ---- epilogue ----
     add_ri32(em, Reg::RSP, extra);
     pop_r64(em, Reg::RBX);
     pop_r64(em, Reg::R15);

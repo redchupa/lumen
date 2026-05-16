@@ -12,3 +12,7 @@ authors.workspace = true
 lumen-codegen.workspace = true
 lumen-ir.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Only used in tests to construct Q8_0 blocks for the fused-matmul kernel check.
+lumen-runtime.workspace = true

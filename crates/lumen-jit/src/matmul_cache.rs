@@ -26,15 +26,21 @@ use crate::exec::{ExecError, ExecRegion};
 /// cache frees them all.
 pub struct MatmulJitCache {
     entries: HashMap<(u32, u32, u32), ExecRegion>,
+    q8_entries: HashMap<(u32, u32, u32), ExecRegion>,
 }
 
 /// Function signature emitted by `lumen_codegen::x86_64` for matmul.
 pub type MatmulFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32);
 
+/// Function signature for the Q8_0 × F32 fused matmul kernel.
+/// First argument is the raw Q8_0 block buffer (`*const u8`).
+pub type Q8MatmulFn = unsafe extern "C" fn(*const u8, *const f32, *mut f32);
+
 impl MatmulJitCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            q8_entries: HashMap::new(),
         }
     }
 
@@ -44,6 +50,11 @@ impl MatmulJitCache {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Number of Q8 fused kernels currently cached.
+    pub fn q8_len(&self) -> usize {
+        self.q8_entries.len()
     }
 
     /// Returns a cached kernel for `(M, K, N)`, compiling on first request.
@@ -61,6 +72,24 @@ impl MatmulJitCache {
         // shape matches what the kernel was compiled for.
         Ok(unsafe { region.as_fn::<MatmulFn>() })
     }
+
+    /// Returns a cached fused Q8_0×F32 kernel of shape
+    /// `(weights[M, K]: q8_0) @ (activations[K, N]: f32) → (out[M, N]: f32)`.
+    /// Constraints: `K % 32 == 0`. `N == 1` (decode) or `N % 8 == 0` (prefill).
+    pub fn get_or_compile_q8(&mut self, m: u32, k: u32, n: u32) -> Result<Q8MatmulFn, JitError> {
+        let key = (m, k, n);
+        let region = match self.q8_entries.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let compiled = compile_q8_matmul(m, k, n)?;
+                v.insert(compiled)
+            }
+        };
+        // SAFETY: the region was produced by `lumen_codegen::x86_64` via the
+        // Q8 fused IR pattern (Param Q8 + Param F32 + Dequantize + MatMul +
+        // Return), which emits a `Q8MatmulFn`-signature function.
+        Ok(unsafe { region.as_fn::<Q8MatmulFn>() })
+    }
 }
 
 impl Default for MatmulJitCache {
@@ -75,6 +104,67 @@ pub enum JitError {
     Codegen(String),
     #[error("exec region setup failed: {0}")]
     Exec(#[from] ExecError),
+}
+
+/// Build the IR for a fused Q8_0 weight × F32 activation matmul and
+/// JIT-compile it. IR pattern (recognized by `emit_function_quant_matmul_q8`):
+/// ```text
+///   v0 = Param(0) : tensor<q8_0, [M, K]>     # weights
+///   v1 = Param(1) : tensor<f32,  [K, N]>     # activations
+///   v2 = Dequantize v0 : tensor<f32, [M, K]>
+///   v3 = MatMul v2, v1 : tensor<f32, [M, N]>
+///   return v3
+/// ```
+fn compile_q8_matmul(m: u32, k: u32, n: u32) -> Result<ExecRegion, JitError> {
+    let w_ty = TensorType {
+        dtype: DType::Q8_0,
+        shape: Shape(vec![Dim::Static(m), Dim::Static(k)]),
+    };
+    let a_ty = TensorType {
+        dtype: DType::F32,
+        shape: Shape(vec![Dim::Static(k), Dim::Static(n)]),
+    };
+    let dq_ty = TensorType {
+        dtype: DType::F32,
+        shape: Shape(vec![Dim::Static(m), Dim::Static(k)]),
+    };
+    let c_ty = TensorType {
+        dtype: DType::F32,
+        shape: Shape(vec![Dim::Static(m), Dim::Static(n)]),
+    };
+
+    let mut f = Function::new(
+        "quant_matmul",
+        vec![w_ty.clone(), a_ty.clone()],
+        c_ty.clone(),
+    );
+    let w = f.param_values[0];
+    let a = f.param_values[1];
+    let dq = f.push(Value {
+        op: Op::Dequantize { x: w },
+        ty: dq_ty,
+    });
+    let prod = f.push(Value {
+        op: Op::MatMul { lhs: dq, rhs: a },
+        ty: c_ty,
+    });
+    let placeholder = TensorType {
+        dtype: DType::F32,
+        shape: Shape(vec![]),
+    };
+    f.push(Value {
+        op: Op::Return { value: prod },
+        ty: placeholder,
+    });
+
+    let ir = IrModule { functions: vec![f] };
+
+    let backend = X86_64::host();
+    let mc = backend
+        .lower(&ir, &CodegenOpts::default())
+        .map_err(|e| JitError::Codegen(format!("{:?}", e)))?;
+    let region = ExecRegion::from_machine_code(&mc)?;
+    Ok(region)
 }
 
 /// Build the IR for an `A @ B` matmul of the given shapes and JIT-compile it.
@@ -214,6 +304,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Phase 7.D: fused Q8 × F32 matmul for the decode shape (N=1). Verifies
+    /// the new K-direction kernel produces the same result as
+    /// dequant-then-naive-matmul on a range of M and K.
+    #[test]
+    fn q8_n1_kernel_matches_dequant_then_naive() {
+        use lumen_runtime::quant::{dequantize_q8_0, quantize_q8_0, BlockQ8_0};
+
+        let mut cache = MatmulJitCache::new();
+        // Shapes representative of decode-time projections / lm_head:
+        //   - M=8,  K=32  : smallest case, one Q8 block per row.
+        //   - M=16, K=64  : two blocks per row.
+        //   - M=32, K=128 : larger row count.
+        //   - M=7,  K=256 : odd M, big K to surface accumulator issues.
+        for &(m, k) in &[(8u32, 32), (16, 64), (32, 128), (7, 256)] {
+            let n: u32 = 1;
+
+            // Random-ish but deterministic F32 weight matrix.
+            let wts_f32: Vec<f32> = (0..(m * k) as usize)
+                .map(|i| (((i % 17) as f32) - 8.0) * 0.12)
+                .collect();
+            // Quantize to Q8_0.
+            let mut wts_q8 = vec![
+                BlockQ8_0 {
+                    d: 0,
+                    qs: [0i8; 32]
+                };
+                (m * k / 32) as usize
+            ];
+            quantize_q8_0(&wts_f32, &mut wts_q8);
+            // Reference: dequant back and run naive matmul on the dequantized values.
+            // (The JIT kernel fuses these two steps; agreement here means the
+            // fusion was correct, not that quantize is lossless.)
+            let mut wts_dq = vec![0.0f32; (m * k) as usize];
+            dequantize_q8_0(&wts_q8, &mut wts_dq);
+
+            let acts: Vec<f32> = (0..(k * n) as usize)
+                .map(|i| (((i % 11) as f32) - 5.0) * 0.07)
+                .collect();
+            let want = naive(&wts_dq, &acts, m as usize, k as usize, n as usize);
+
+            let f = cache
+                .get_or_compile_q8(m, k, n)
+                .unwrap_or_else(|e| panic!("compile q8 ({},{},{}): {}", m, k, n, e));
+            let mut out = vec![0.0f32; (m * n) as usize];
+            // SAFETY: kernel was just compiled for this exact (M,K,N) Q8 shape.
+            unsafe {
+                f(
+                    wts_q8.as_ptr() as *const u8,
+                    acts.as_ptr(),
+                    out.as_mut_ptr(),
+                )
+            };
+
+            // Tolerance is generous: we accumulate K FMAs of fp32 values, and
+            // the rms of fp32 rounding scales with sqrt(K).
+            let tol = 1e-3 * (k as f32).sqrt();
+            for (idx, (g, w)) in out.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() < tol,
+                    "shape ({},{},{}) row {}: {} vs {} (tol {})",
+                    m,
+                    k,
+                    n,
+                    idx,
+                    g,
+                    w,
+                    tol
+                );
+            }
+        }
+        // Cache should hold one Q8 entry per distinct shape.
+        assert_eq!(cache.q8_len(), 4);
     }
 
     #[test]

@@ -65,19 +65,19 @@ fn qwen_2_5_0_5b_model_loads_with_biases() {
     assert_eq!(model.layers.len(), 24);
     assert_eq!(model.token_embeddings.len(), 896 * 151936);
     assert_eq!(model.final_norm_w.len(), 896);
-    assert_eq!(model.lm_head_w.len(), 896 * 151936);
+    assert_eq!(model.lm_head_w.nelem(), 896 * 151936);
 
     // First-layer sanity
     let l0 = &model.layers[0];
     assert_eq!(l0.attn_norm_w.len(), 896);
-    assert_eq!(l0.wq.len(), 896 * 896);
-    assert_eq!(l0.wk.len(), 128 * 896);
-    assert_eq!(l0.wv.len(), 128 * 896);
-    assert_eq!(l0.wo.len(), 896 * 896);
+    assert_eq!(l0.wq.nelem(), 896 * 896);
+    assert_eq!(l0.wk.nelem(), 128 * 896);
+    assert_eq!(l0.wv.nelem(), 128 * 896);
+    assert_eq!(l0.wo.nelem(), 896 * 896);
     assert_eq!(l0.ffn_norm_w.len(), 896);
-    assert_eq!(l0.w_gate.len(), 4864 * 896);
-    assert_eq!(l0.w_up.len(), 4864 * 896);
-    assert_eq!(l0.w_down.len(), 896 * 4864);
+    assert_eq!(l0.w_gate.nelem(), 4864 * 896);
+    assert_eq!(l0.w_up.nelem(), 4864 * 896);
+    assert_eq!(l0.w_down.nelem(), 896 * 4864);
     assert!(l0.b_q.is_some(), "Qwen2 should populate b_q");
     assert_eq!(l0.b_q.as_ref().unwrap().len(), 896);
     assert_eq!(l0.b_k.as_ref().unwrap().len(), 128);
@@ -380,15 +380,18 @@ fn qwen_lm_head_jit_matches_naive_and_is_faster() {
         .map(|i| ((i % 37) as f32) * 0.001 - 0.02)
         .collect();
 
+    // Materialize lm_head as F32 once for the per-call comparisons below.
+    let lm_head_native = model.lm_head_w.as_f32_native(vocab, hidden);
+
     // --- naive ---
     let t_naive = std::time::Instant::now();
-    let naive_logits = naive_weight_matmul(&activation, &model.lm_head_w, hidden, vocab);
+    let naive_logits = naive_weight_matmul(&activation, &lm_head_native, hidden, vocab);
     let naive_elapsed = t_naive.elapsed();
     eprintln!("lm_head naive : {:>10?}", naive_elapsed);
 
     // --- prepare JIT: transpose lm_head from [vocab, hidden] to [hidden, vocab] ---
     let t_prep = std::time::Instant::now();
-    let lm_head_t = transpose_n_k_to_k_n(&model.lm_head_w, vocab, hidden);
+    let lm_head_t = transpose_n_k_to_k_n(&lm_head_native, vocab, hidden);
     let prep_elapsed = t_prep.elapsed();
     eprintln!("lm_head transp: {:>10?}  (one-time cost)", prep_elapsed);
 
