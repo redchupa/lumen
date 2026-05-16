@@ -106,6 +106,17 @@ pub fn mov_ri64(em: &mut Emitter, dst: Reg, imm: u64) {
     em.u64(imm);
 }
 
+/// `mov dst32, imm32` — 32-bit immediate. Useful for loading scalar fp32
+/// constants (cast via `to_bits()`) before promoting to xmm with `vmovd`.
+/// Encoding: `[REX.B] B8+r imm32`.
+pub fn mov_ri32(em: &mut Emitter, dst: Reg, imm: u32) {
+    if dst.high1() != 0 {
+        em.u8(0x41); // REX.B
+    }
+    em.u8(0xB8 + dst.low3());
+    em.u32(imm);
+}
+
 /// `xor dst, dst` (64-bit; sets dst = 0). Same as `xor edst, edst` but with REX.W.
 pub fn xor_rr(em: &mut Emitter, dst: Reg) {
     em.u8(rex(true, dst.high1(), 0, dst.high1()));

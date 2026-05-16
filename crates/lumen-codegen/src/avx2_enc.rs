@@ -383,6 +383,105 @@ pub fn vcvtsi2ss_xmm_r32(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Reg) {
     em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
 }
 
+/// `vhaddps ymm_dst, ymm_src1, ymm_src2` — horizontal add of packed floats.
+/// Used for the final reduce-step of an 8-wide sum-of-squares accumulator.
+///
+/// Encoding: VEX.NDS.256.F2.0F.WIG 7C /r
+pub fn vhaddps_ymm(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        1,
+        Prefix::PF2,
+    );
+    em.u8(0x7C);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vextractf128 xmm_dst, ymm_src, imm8` — copy lane `imm8` (0 = lower,
+/// 1 = upper) of a 256-bit `ymm` into an xmm register.
+///
+/// Encoding: VEX.256.66.0F3A.W0 19 /r ib
+/// Operand mapping: ModR/M.reg = src (ymm), ModR/M.rm = dst (xmm).
+pub fn vextractf128_xmm(em: &mut Emitter, dst: Ymm, src: Ymm, imm: u8) {
+    emit_vex(
+        em,
+        src.high1(),
+        0,
+        dst.high1(),
+        OpcodeMap::M0F3A,
+        0,
+        0,
+        1,
+        Prefix::P66,
+    );
+    em.u8(0x19);
+    em.u8(0b11_000_000 | (src.low3() << 3) | dst.low3());
+    em.u8(imm);
+}
+
+/// `vsqrtss xmm_dst, xmm_src1, xmm_src2` — scalar fp32 sqrt (low lane only).
+///
+/// Encoding: VEX.NDS.LIG.F3.0F.WIG 51 /r
+pub fn vsqrtss_xmm(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        0,
+        Prefix::PF3,
+    );
+    em.u8(0x51);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vdivss xmm_dst, xmm_src1, xmm_src2` — scalar fp32 divide (low lane).
+///
+/// Encoding: VEX.NDS.LIG.F3.0F.WIG 5E /r
+pub fn vdivss_xmm(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        0,
+        Prefix::PF3,
+    );
+    em.u8(0x5E);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vaddss xmm_dst, xmm_src1, xmm_src2` — scalar fp32 add (low lane).
+///
+/// Encoding: VEX.NDS.LIG.F3.0F.WIG 58 /r
+pub fn vaddss_xmm(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        0,
+        Prefix::PF3,
+    );
+    em.u8(0x58);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
 /// `vmulss xmm_dst, xmm_src1, xmm_src2` — scalar fp32 multiply (low lane only).
 ///
 /// Encoding: VEX.NDS.LIG.F3.0F.WIG 59 /r
@@ -536,5 +635,43 @@ mod tests {
         let bytes = enc(|e| vmulss_xmm(e, Ymm(0), Ymm(0), Ymm(0)));
         assert_eq!(bytes[0], 0xC5);
         assert!(bytes.contains(&0x59));
+    }
+
+    #[test]
+    fn encodes_vhaddps_ymm() {
+        // vhaddps ymm0, ymm0, ymm0
+        let bytes = enc(|e| vhaddps_ymm(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert_eq!(bytes[0], 0xC5);
+        assert!(bytes.contains(&0x7C));
+    }
+
+    #[test]
+    fn encodes_vextractf128_xmm() {
+        // vextractf128 xmm1, ymm0, 1
+        let bytes = enc(|e| vextractf128_xmm(e, Ymm(1), Ymm(0), 1));
+        assert_eq!(bytes[0], 0xC4); // 3-byte VEX (0F 3A)
+        assert!(bytes.contains(&0x19));
+        assert_eq!(*bytes.last().unwrap(), 1);
+    }
+
+    #[test]
+    fn encodes_vsqrtss_xmm() {
+        let bytes = enc(|e| vsqrtss_xmm(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert_eq!(bytes[0], 0xC5);
+        assert!(bytes.contains(&0x51));
+    }
+
+    #[test]
+    fn encodes_vdivss_xmm() {
+        let bytes = enc(|e| vdivss_xmm(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert_eq!(bytes[0], 0xC5);
+        assert!(bytes.contains(&0x5E));
+    }
+
+    #[test]
+    fn encodes_vaddss_xmm() {
+        let bytes = enc(|e| vaddss_xmm(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert_eq!(bytes[0], 0xC5);
+        assert!(bytes.contains(&0x58));
     }
 }

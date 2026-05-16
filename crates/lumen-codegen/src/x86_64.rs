@@ -13,9 +13,10 @@
 //! Layout assumption: row-major, fp32, contiguous. Buffers are caller-owned.
 
 use crate::avx2_enc::{
-    vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm, vcvtsi2ss_xmm_r32, vfmadd231ps_mem,
-    vfmadd231ps_reg, vmovd_load, vmovups_load, vmovups_store, vmulps_reg, vmulss_xmm,
-    vpmovsxbd_load, vxorps_zero, Ymm,
+    vaddss_xmm, vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm, vcvtsi2ss_xmm_r32,
+    vdivss_xmm, vextractf128_xmm, vfmadd231ps_mem, vfmadd231ps_reg, vhaddps_ymm, vmovd_load,
+    vmovups_load, vmovups_store, vmulps_reg, vmulss_xmm, vpmovsxbd_load, vsqrtss_xmm, vxorps_zero,
+    Ymm,
 };
 use crate::backend::{Backend, Capabilities, CodegenError, CodegenOpts, MachineCode};
 use crate::emit::Emitter;
@@ -110,11 +111,17 @@ impl Backend for X86_64 {
 // Function emission
 // ============================================================================
 
-/// Emit one function. Three patterns supported:
+/// Emit one function. Four patterns supported:
 /// - quant matmul: `Param(q8_0), Param(f32), Dequantize, MatMul, Return`  (Phase 5.C)
 /// - matmul:       `Param, Param, MatMul, Return`                         (Phase 2.B/3)
 /// - dequant:      `Param, Dequantize, Return`                            (Phase 5.B)
+/// - rms norm:     `Param(f32, [H]), Param(f32, [H]), RmsNorm, Return`    (Phase 6.C.2)
 fn emit_function(em: &mut Emitter, f: &Function, abi: Abi, avx2: bool) -> Result<(), CodegenError> {
+    let has_rms = f.values.iter().any(|v| matches!(v.op, Op::RmsNorm { .. }));
+    if has_rms {
+        return emit_function_rms_norm(em, f, abi);
+    }
+
     let has_dequant = f
         .values
         .iter()
@@ -728,6 +735,247 @@ fn emit_quant_matmul_q8_body(
     pop_r64(em, Reg::R13);
     pop_r64(em, Reg::R12);
     ret(em);
+}
+
+/// Emit an RMSNorm function: `y = (x * inv_rms) * weight`.
+///
+/// Source IR:
+/// ```text
+///   v0 = Param(0) : tensor<f32, [H]>     # input
+///   v1 = Param(1) : tensor<f32, [H]>     # learned scale
+///   v2 = RmsNorm v0, v1, eps : tensor<f32, [H]>
+///   return v2
+/// ```
+///
+/// Algorithm (two passes over the vector):
+/// 1. Sum of squares → reduce to scalar → `inv_rms = 1 / sqrt(sum/H + eps)`
+/// 2. `y[i] = x[i] * inv_rms * weight[i]`
+///
+/// Scope: 1-D input only, `H % 8 == 0` (one 8-wide ymm tile fits the row).
+fn emit_function_rms_norm(em: &mut Emitter, f: &Function, abi: Abi) -> Result<(), CodegenError> {
+    let rms_idx = f
+        .values
+        .iter()
+        .position(|v| matches!(v.op, Op::RmsNorm { .. }))
+        .unwrap();
+    let (x_id, w_id, eps) = match &f.values[rms_idx].op {
+        Op::RmsNorm { x, weight, eps } => (*x, *weight, *eps),
+        _ => unreachable!(),
+    };
+
+    let x_ty = &f.values[x_id.0 as usize].ty;
+    let w_ty = &f.values[w_id.0 as usize].ty;
+    if x_ty.dtype != DType::F32 || w_ty.dtype != DType::F32 {
+        return Err(CodegenError::UnsupportedOp(
+            "Phase 6.C.2: rms_norm only supports f32 inputs".into(),
+        ));
+    }
+    if x_ty.shape.0.len() != 1 || w_ty.shape.0.len() != 1 {
+        return Err(CodegenError::UnsupportedOp(
+            "Phase 6.C.2: rms_norm requires 1-D input and weight".into(),
+        ));
+    }
+    let h = match x_ty.shape.0[0] {
+        Dim::Static(v) => v,
+        _ => {
+            return Err(CodegenError::ShapeError(
+                "dynamic dims not supported".into(),
+            ))
+        }
+    };
+    if h % 8 != 0 {
+        return Err(CodegenError::ShapeError(
+            "Phase 6.C.2: H must be a multiple of 8".into(),
+        ));
+    }
+
+    let x_param = match f.values[x_id.0 as usize].op {
+        Op::Param { index } => index,
+        _ => {
+            return Err(CodegenError::UnsupportedOp(
+                "rms_norm x must be Param".into(),
+            ))
+        }
+    };
+    let w_param = match f.values[w_id.0 as usize].op {
+        Op::Param { index } => index,
+        _ => {
+            return Err(CodegenError::UnsupportedOp(
+                "rms_norm weight must be Param".into(),
+            ))
+        }
+    };
+
+    let p_x = abi.param_reg(x_param);
+    let p_w = abi.param_reg(w_param);
+    let p_out = abi.param_reg(f.params.len() as u32);
+
+    emit_rms_norm_body(em, p_x, p_w, p_out, h as i32, eps, abi);
+    Ok(())
+}
+
+/// Pseudo-asm. R12=x_base, R13=w_base, R14=out_base. RCX=i.
+///
+/// ```text
+/// ; --- pass 1: sum of squares ---
+/// vxorps ymm0, ymm0, ymm0
+/// xor rcx, rcx
+/// loop1:
+///   cmp rcx, H
+///   jge done1
+///   vmovups ymm1, [r12 + rcx*4]
+///   vfmadd231ps ymm0, ymm1, ymm1     ; ymm0 += x * x
+///   add rcx, 8
+///   jmp loop1
+/// done1:
+///
+/// ; --- reduce ymm0 to scalar xmm0 ---
+/// vhaddps   ymm0, ymm0, ymm0          ; sum adjacent pairs
+/// vhaddps   ymm0, ymm0, ymm0          ; sum again
+/// vextractf128 xmm1, ymm0, 1
+/// vaddss    xmm0, xmm0, xmm1          ; xmm0[0] = full sum
+///
+/// ; --- compute inv_rms ---
+/// mov   eax, 1/H bits
+/// vmovd xmm1, eax
+/// vmulss xmm0, xmm0, xmm1             ; xmm0 = mean(x²)
+/// mov   eax, eps bits
+/// vmovd xmm1, eax
+/// vaddss xmm0, xmm0, xmm1             ; + eps
+/// vsqrtss xmm0, xmm0, xmm0
+/// mov   eax, 1.0 bits
+/// vmovd xmm1, eax
+/// vdivss xmm0, xmm1, xmm0             ; inv_rms = 1.0 / sqrt(...)
+/// vbroadcastss ymm2, xmm0             ; ymm2 = (inv_rms × 8)
+///
+/// ; --- pass 2: y = x * inv_rms * weight ---
+/// xor rcx, rcx
+/// loop2:
+///   cmp rcx, H
+///   jge done2
+///   vmovups ymm0, [r12 + rcx*4]      ; x
+///   vmovups ymm1, [r13 + rcx*4]      ; weight
+///   vmulps  ymm0, ymm0, ymm2         ; x * inv_rms
+///   vmulps  ymm0, ymm0, ymm1         ; * weight
+///   vmovups [r14 + rcx*4], ymm0
+///   add rcx, 8
+///   jmp loop2
+/// done2:
+/// ```
+fn emit_rms_norm_body(
+    em: &mut Emitter,
+    p_x: Reg,
+    p_w: Reg,
+    p_out: Reg,
+    h: i32,
+    eps: f32,
+    abi: Abi,
+) {
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_x);
+    mov_rr(em, Reg::R13, p_w);
+    mov_rr(em, Reg::R14, p_out);
+
+    // pass 1: sum of squares into ymm0
+    vxorps_zero(em, Ymm(0));
+    xor_rr(em, Reg::RCX);
+    let l1 = em.len();
+    cmp_ri32(em, Reg::RCX, h);
+    let jge1 = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+    // ymm1 = load x[rcx..rcx+8]
+    vmovups_load(em, Ymm(1), Reg::R12, Some((Reg::RCX, Scale::S4)), 0);
+    // ymm0 += ymm1 * ymm1
+    vfmadd231ps_reg(em, Ymm(0), Ymm(1), Ymm(1));
+    add_ri32(em, Reg::RCX, 8);
+    let jmp1 = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp1, l1);
+    let done1 = em.len();
+    patch_rel32(em, jge1, done1);
+
+    // reduce ymm0 → scalar xmm0
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vextractf128_xmm(em, Ymm(1), Ymm(0), 1);
+    vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
+
+    // xmm0 *= 1/H
+    let inv_h_bits = (1.0f32 / h as f32).to_bits();
+    mov_ri32(em, Reg::RAX, inv_h_bits);
+    vmovd_load_reg(em, Ymm(1), Reg::RAX); // xmm1 = inv_h
+    vmulss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
+
+    // xmm0 += eps
+    mov_ri32(em, Reg::RAX, eps.to_bits());
+    vmovd_load_reg(em, Ymm(1), Reg::RAX);
+    vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
+
+    // xmm0 = sqrt(xmm0)
+    vsqrtss_xmm(em, Ymm(0), Ymm(0), Ymm(0));
+
+    // xmm0 = 1.0 / xmm0
+    mov_ri32(em, Reg::RAX, 1.0f32.to_bits());
+    vmovd_load_reg(em, Ymm(1), Reg::RAX);
+    vdivss_xmm(em, Ymm(0), Ymm(1), Ymm(0));
+
+    // broadcast to ymm2
+    vbroadcastss_xmm(em, Ymm(2), Ymm(0));
+
+    // pass 2: y = x * inv_rms * weight
+    xor_rr(em, Reg::RCX);
+    let l2 = em.len();
+    cmp_ri32(em, Reg::RCX, h);
+    let jge2 = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+    vmovups_load(em, Ymm(0), Reg::R12, Some((Reg::RCX, Scale::S4)), 0);
+    vmovups_load(em, Ymm(1), Reg::R13, Some((Reg::RCX, Scale::S4)), 0);
+    vmulps_reg(em, Ymm(0), Ymm(0), Ymm(2));
+    vmulps_reg(em, Ymm(0), Ymm(0), Ymm(1));
+    vmovups_store(em, Ymm(0), Reg::R14, Some((Reg::RCX, Scale::S4)), 0);
+    add_ri32(em, Reg::RCX, 8);
+    let jmp2 = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp2, l2);
+    let done2 = em.len();
+    patch_rel32(em, jge2, done2);
+
+    // epilogue
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// Helper: `vmovd xmm_dst, r32_src` — register-to-xmm 4-byte move.
+/// Encoding: VEX.128.66.0F.W0 6E /r  (reg form, ModR/M.mod = 11).
+fn vmovd_load_reg(em: &mut Emitter, dst: Ymm, src: Reg) {
+    // We use the avx2_enc::vmovd_load helper for the memory form already; the
+    // register form needs ModR/M.mod = 11. Inline it.
+    use crate::avx2_enc::{OpcodeMap, Prefix};
+    // 2-byte VEX path (no extension bits needed for xmm0..xmm7 + rax..rdi).
+    let r = dst.high1();
+    let b = src.high1();
+    let three_byte = b != 0;
+    let inv_vvvv = 0b1111u8;
+    if three_byte {
+        em.u8(0xC4);
+        let b1 = (((!r) & 1) << 7) | (1 << 6) | (((!b) & 1) << 5) | (OpcodeMap::M0F as u8);
+        // W=0, vvvv=1111, L=0, pp=P66
+        let b2 = (inv_vvvv << 3) | (Prefix::P66 as u8);
+        em.u8(b1);
+        em.u8(b2);
+    } else {
+        em.u8(0xC5);
+        // R̄=~r, vvvv=1111, L=0, pp=P66
+        let b1 = (((!r) & 1) << 7) | (inv_vvvv << 3) | (Prefix::P66 as u8);
+        em.u8(b1);
+    }
+    em.u8(0x6E);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src.low3());
 }
 
 /// Emit a Q8_0 dequantize function.
