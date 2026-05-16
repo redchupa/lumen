@@ -319,7 +319,19 @@ mod tests {
         //   - M=16, K=64  : two blocks per row.
         //   - M=32, K=128 : larger row count.
         //   - M=7,  K=256 : odd M, big K to surface accumulator issues.
-        for &(m, k) in &[(8u32, 32), (16, 64), (32, 128), (7, 256)] {
+        for &(m, k) in &[
+            (8u32, 32),
+            (16, 64),
+            (32, 128),
+            (7, 256),
+            // Phase 7.G additions — exercise the multi-accumulator kernel at
+            // shapes closer to Qwen2.5-0.5B's actual decode matmuls so that
+            // FMA dependency-chain bugs surface in the unit test, not just
+            // in e2e.
+            (896, 896),  // QKV proj-ish, lm_head row stride
+            (128, 4864), // FFN-ish (small d_out, large d_in)
+            (4864, 896), // FFN gate/up (large d_out, small d_in)
+        ] {
             let n: u32 = 1;
 
             // Random-ish but deterministic F32 weight matrix.
@@ -377,7 +389,7 @@ mod tests {
             }
         }
         // Cache should hold one Q8 entry per distinct shape.
-        assert_eq!(cache.q8_len(), 4);
+        assert_eq!(cache.q8_len(), 7);
     }
 
     #[test]

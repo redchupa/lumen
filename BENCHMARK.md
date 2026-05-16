@@ -25,11 +25,20 @@ and microkernel tuning. The gap is meaningful and we own it.
 | Lumen naive Rust matmul | 2.91 | 14.2× slower |
 | Lumen JIT (4×8 tile / 1×8 AVX2, 1-acc) | 4.43 | 9.3× slower |
 | Lumen JIT (+ 1×N 4-acc decode path, Phase 7.C) | 5.08 | 8.1× slower |
-| **Lumen JIT (+ Q8-native fused matmul, Phase 7.D)** | **17.97** | **2.30× slower** |
+| Lumen JIT (+ Q8-native fused matmul, Phase 7.D) | 17.97 | 2.30× slower |
+| **Lumen JIT (+ 4-acc Q8 N=1 kernel, Phase 7.G)** | **29.10** | **1.42× slower** |
 | llama.cpp (ggml) | 41.32 | 1.0× |
 
-The 5.08 → 17.97 jump (**+3.5×, +254% vs the original 4.43**) comes from
-keeping Q8_0 weights in their native layout end-to-end instead of
+Phase 7.G applied the same multi-accumulator trick from 7.C to the Q8
+N=1 kernel: 4 independent ymm accumulators (one per 8-element chunk of
+each Q8 block) instead of one chain through ymm0. All five Q8 matmul
+shapes in the decode forward (gate_up, down, lm_head, qkv, wo) got
+between **1.87× and 1.95× faster** — essentially matching the theoretical
+~2× from breaking the 4-FMA dependency chain, bounded by memory bandwidth
+on the weight stream.
+
+The 5.08 → 17.97 jump (**+3.5×, +254% vs the original 4.43**) in 7.D came
+from keeping Q8_0 weights in their native layout end-to-end instead of
 dequantizing to F32 at load time:
 
 - weights stay 1× as many bytes (Q8: 1.0625 B/elt vs F32: 4 B/elt) — 4×

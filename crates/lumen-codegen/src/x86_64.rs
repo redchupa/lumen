@@ -13,10 +13,10 @@
 //! Layout assumption: row-major, fp32, contiguous. Buffers are caller-owned.
 
 use crate::avx2_enc::{
-    vaddss_xmm, vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm, vcvtsi2ss_xmm_r32,
-    vdivss_xmm, vextractf128_xmm, vfmadd231ps_mem, vfmadd231ps_reg, vhaddps_ymm, vmovd_load,
-    vmovups_load, vmovups_store, vmulps_reg, vmulss_xmm, vpmovsxbd_load, vsqrtss_xmm, vxorps_zero,
-    Ymm,
+    vaddps_reg, vaddss_xmm, vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm,
+    vcvtsi2ss_xmm_r32, vdivss_xmm, vextractf128_xmm, vfmadd231ps_mem, vfmadd231ps_reg, vhaddps_ymm,
+    vmovd_load, vmovups_load, vmovups_store, vmulps_reg, vmulss_xmm, vpmovsxbd_load, vsqrtss_xmm,
+    vxorps_zero, Ymm,
 };
 use crate::backend::{Backend, Capabilities, CodegenError, CodegenOpts, MachineCode};
 use crate::emit::Emitter;
@@ -751,33 +751,37 @@ fn emit_quant_matmul_q8_body(
 
 /// Q8 × F32 fused matmul, N=1 specialization for decode.
 ///
-/// The 5.C-style 5.C body vectorizes the *output column* with N=8 ymm lanes.
-/// Decode hands us N=1 — there's nothing to vectorize on the output dim, so
-/// we re-derive the SIMD on the *K direction* instead:
+/// Phase 7.G: replaces the 1-accumulator variant. Decode profiling showed
+/// 88% of forward time was matmul, and within the Q8 N=1 kernel every
+/// `vfmadd231ps` of one Q8 block (4 of them) accumulated into the same
+/// `ymm0`, serializing 4 FMAs into a single dependency chain (4-cycle
+/// latency × 4 FMAs = 16 cycles minimum per Q8 block).
+///
+/// This version uses **four independent accumulators** — one per 8-element
+/// chunk of a Q8 block. The FMAs across a block now issue back-to-back, and
+/// only the cross-block accumulation needs to wait. We also fold the
+/// activation load into a memory-operand FMA, dropping one op per inner.
 ///
 ///   for i in 0..M:                              # output row
-///     ymm0 = 0                                  # 8-wide accumulator
+///     ymm0..ymm3 = 0                            # 4 × 8-wide accumulators
 ///     for kb in 0..K/32:                        # Q8_0 block index
-///       load fp16 d → broadcast → ymm_d
-///       # 4 unrolled 8-wide iterations over the 32 elements of the block:
-///       for inner in [0, 8, 16, 24]:
-///         vpmovsxbd ymm_w = 8 i8 weights → 8 i32
-///         vcvtdq2ps ymm_w → 8 fp32
-///         vmulps    ymm_w *= ymm_d              # scaled weights
-///         vmovups   ymm_a = 8 activations
-///         vfmadd231ps ymm0 += ymm_w * ymm_a
-///     # horizontal sum ymm0 -> scalar
-///     vhaddps ymm0, ymm0, ymm0   ; pair-reduce within each 128-bit lane
-///     vhaddps ymm0, ymm0, ymm0
-///     vextractf128 xmm1, ymm0, 1 ; high 128 → xmm1[0]
-///     vaddss xmm0, xmm0, xmm1    ; low + high → scalar
-///     movss [out + i*4], xmm0
+///       load fp16 d → broadcast → ymm5
+///       # 4 unrolled 8-wide chunks across the block, each into its own acc:
+///       for (inner, acc) in [(0,0), (8,1), (16,2), (24,3)]:
+///         vpmovsxbd ymm6, [w + 2 + inner]       ; 8 i8 → 8 i32
+///         vcvtdq2ps ymm6, ymm6                  ; → 8 fp32
+///         vmulps    ymm6, ymm6, ymm5            ; scaled weights
+///         vfmadd231ps_mem ymm_acc, ymm6, [act + (kb*32+inner)*4]
+///     # ymm0 += ymm1 + ymm2 + ymm3 (still 8-wide); then horizontal reduce.
+///     vaddps ymm0, ymm0, ymm1
+///     vaddps ymm2, ymm2, ymm3
+///     vaddps ymm0, ymm0, ymm2
+///     vhaddps × 2 → vextractf128 → vaddss → movss
 ///
-/// Compared to 5.C's body for N=8 (its smallest valid N), this kernel does
-/// the same total work per row while doing it in K-direction instead of
-/// N-direction. The win versus the existing model path is *eliminating the
-/// fp32 dequant pass entirely* — weights stay in Q8 form on the matmul hot
-/// path, so we cut memory bandwidth by ~4×.
+/// The win versus the model's prior fp32 dequant-then-matmul path is
+/// already captured (eliminating the dequant pass + transpose). This phase
+/// adds another factor on top by hiding FMA latency the same way Phase 7.C
+/// did for the fp32 kernel.
 #[allow(clippy::too_many_arguments)]
 fn emit_quant_matmul_q8_n1_body(
     em: &mut Emitter,
@@ -804,15 +808,18 @@ fn emit_quant_matmul_q8_n1_body(
     mov_rr(em, Reg::R13, p_a);
     mov_rr(em, Reg::R14, p_out);
 
-    // R15 = i (output row), R11 = kb. R10 = kb*32 (activation row-base index).
-    // RAX = absolute byte offset of current (i, kb) block.
+    // R15 = i (output row), R11 = kb. R10 = kb*32 (activation index base).
+    // RAX = absolute byte offset of current (i, kb) Q8 block.
     xor_rr(em, Reg::R15);
     let i_loop = em.len();
     cmp_ri32(em, Reg::R15, m);
     let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
 
-    // ymm0 = 0
+    // 4 accumulators zeroed.
     vxorps_zero(em, Ymm(0));
+    vxorps_zero(em, Ymm(1));
+    vxorps_zero(em, Ymm(2));
+    vxorps_zero(em, Ymm(3));
 
     xor_rr(em, Reg::R11); // kb = 0
     let kb_loop = em.len();
@@ -826,27 +833,38 @@ fn emit_quant_matmul_q8_n1_body(
     imul_rri32(em, Reg::RDX, Reg::RDX, 34);
     add_rr(em, Reg::RAX, Reg::RDX);
 
-    // ymm2 = broadcast(fp16_to_fp32(d))
-    vmovd_load(em, Ymm(2), Reg::R12, Some((Reg::RAX, Scale::S1)), 0);
-    vcvtph2ps_xmm(em, Ymm(2), Ymm(2));
-    vbroadcastss_xmm(em, Ymm(2), Ymm(2));
+    // ymm5 = broadcast(fp16_to_fp32(d))
+    vmovd_load(em, Ymm(5), Reg::R12, Some((Reg::RAX, Scale::S1)), 0);
+    vcvtph2ps_xmm(em, Ymm(5), Ymm(5));
+    vbroadcastss_xmm(em, Ymm(5), Ymm(5));
 
-    // R10 = kb * 32 (activation float index for this block)
+    // R10 = kb * 32 (activation float index base for this block)
     mov_rr(em, Reg::R10, Reg::R11);
     imul_rri32(em, Reg::R10, Reg::R10, 32);
 
-    // 4 unrolled 8-wide chunks across the 32-element Q8_0 block.
-    for inner in [0i32, 8, 16, 24] {
-        // ymm3 = sign-ext 8 bytes -> 8 i32 from [r12 + rax + 2 + inner]
-        vpmovsxbd_load(em, Ymm(3), Reg::R12, Some((Reg::RAX, Scale::S1)), 2 + inner);
-        // ymm3 = i32→f32
-        vcvtdq2ps(em, Ymm(3), Ymm(3));
-        // ymm3 *= ymm2 (broadcast d)
-        vmulps_reg(em, Ymm(3), Ymm(3), Ymm(2));
-        // ymm4 = 8 activations from [r13 + (kb*32 + inner)*4]
-        vmovups_load(em, Ymm(4), Reg::R13, Some((Reg::R10, Scale::S4)), inner * 4);
-        // ymm0 += ymm3 * ymm4
-        vfmadd231ps_reg(em, Ymm(0), Ymm(3), Ymm(4));
+    // 4 unrolled 8-wide chunks. Each one accumulates into its own ymm acc,
+    // so the 4 FMAs in this block are independent at the architectural level
+    // and can issue back-to-back instead of serializing on ymm0.
+    //
+    // Register choice note: ymm0..ymm5 are caller-saved under both Win64 and
+    // SysV. ymm6-ymm15 are *callee-saved on Win64* — clobbering them without
+    // a save/restore corrupts the caller's float state across the call (this
+    // exact bug surfaced as NaN logits on Qwen even though the unit test
+    // passed: unit tests have no surrounding state to be poisoned).
+    for (inner, acc) in [(0i32, 0u8), (8, 1), (16, 2), (24, 3)] {
+        // ymm4 = sign-ext 8 i8 -> 8 i32 -> 8 fp32 -> * d
+        vpmovsxbd_load(em, Ymm(4), Reg::R12, Some((Reg::RAX, Scale::S1)), 2 + inner);
+        vcvtdq2ps(em, Ymm(4), Ymm(4));
+        vmulps_reg(em, Ymm(4), Ymm(4), Ymm(5));
+        // ymm_acc += ymm4 * [r13 + r10*4 + inner*4]  (memory-operand FMA)
+        vfmadd231ps_mem(
+            em,
+            Ymm(acc),
+            Ymm(4),
+            Reg::R13,
+            Some((Reg::R10, Scale::S4)),
+            inner * 4,
+        );
     }
 
     inc_r(em, Reg::R11);
@@ -856,11 +874,14 @@ fn emit_quant_matmul_q8_n1_body(
     let kb_done = em.len();
     patch_rel32(em, jge_kb, kb_done);
 
+    // Combine the 4 accumulators: ymm0 = ((y0 + y1) + (y2 + y3))
+    vaddps_reg(em, Ymm(0), Ymm(0), Ymm(1));
+    vaddps_reg(em, Ymm(2), Ymm(2), Ymm(3));
+    vaddps_reg(em, Ymm(0), Ymm(0), Ymm(2));
+
     // Horizontal reduce ymm0 (8 fp32 lanes) -> scalar in xmm0[0].
-    // Step 1: pair-reduce within each 128-bit lane (twice gets us 4-lane → 1-lane within lane).
     vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
     vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
-    // Step 2: extract high 128 -> xmm1, then add to xmm0.
     vextractf128_xmm(em, Ymm(1), Ymm(0), 1);
     vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
 
