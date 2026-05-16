@@ -60,6 +60,21 @@ pub struct LayerWeights {
     pub w_gate: Vec<f32>,      // [ffn_hidden, hidden]
     pub w_up: Vec<f32>,        // [ffn_hidden, hidden]
     pub w_down: Vec<f32>,      // [hidden, ffn_hidden]
+    // Qwen2-style attention biases (Llama2/Llama3 omit these → `None`).
+    pub b_q: Option<Vec<f32>>, // [q_dim]
+    pub b_k: Option<Vec<f32>>, // [kv_dim]
+    pub b_v: Option<Vec<f32>>, // [kv_dim]
+}
+
+/// Add `bias` broadcast across each row of `x` (shape `[rows, dim]`).
+fn add_bias_broadcast(x: &mut [f32], bias: &[f32], dim: usize) {
+    debug_assert_eq!(x.len() % dim, 0);
+    debug_assert_eq!(bias.len(), dim);
+    for row in x.chunks_exact_mut(dim) {
+        for (a, b) in row.iter_mut().zip(bias.iter()) {
+            *a += b;
+        }
+    }
 }
 
 /// Naive `[M, K] @ [K, N] -> [M, N]` matmul. The Phase 6.F integration will
@@ -176,10 +191,19 @@ pub fn forward_layer(
         cfg.rms_norm_eps,
     );
 
-    // --- 2. Q / K / V projection ---
+    // --- 2. Q / K / V projection (+ optional Qwen2 biases) ---
     let mut q = weight_matmul(&x_norm, &layer.wq, seq, cfg.hidden, cfg.q_dim());
     let mut k = weight_matmul(&x_norm, &layer.wk, seq, cfg.hidden, cfg.kv_dim());
-    let v = weight_matmul(&x_norm, &layer.wv, seq, cfg.hidden, cfg.kv_dim());
+    let mut v = weight_matmul(&x_norm, &layer.wv, seq, cfg.hidden, cfg.kv_dim());
+    if let Some(b) = &layer.b_q {
+        add_bias_broadcast(&mut q, b, cfg.q_dim());
+    }
+    if let Some(b) = &layer.b_k {
+        add_bias_broadcast(&mut k, b, cfg.kv_dim());
+    }
+    if let Some(b) = &layer.b_v {
+        add_bias_broadcast(&mut v, b, cfg.kv_dim());
+    }
 
     // --- 3. RoPE on Q and K (reshape view-only: layout already
     //         [seq, heads, head_dim]). ---
@@ -303,10 +327,19 @@ pub fn forward_layer_decode(
         cfg.rms_norm_eps,
     );
 
-    // 2. Q / K / V projection (single row each)
+    // 2. Q / K / V projection (single row each), plus optional Qwen2 biases.
     let mut q = weight_matmul(&x_norm, &layer.wq, 1, cfg.hidden, cfg.q_dim());
     let mut k = weight_matmul(&x_norm, &layer.wk, 1, cfg.hidden, cfg.kv_dim());
-    let v = weight_matmul(&x_norm, &layer.wv, 1, cfg.hidden, cfg.kv_dim());
+    let mut v = weight_matmul(&x_norm, &layer.wv, 1, cfg.hidden, cfg.kv_dim());
+    if let Some(b) = &layer.b_q {
+        add_bias_broadcast(&mut q, b, cfg.q_dim());
+    }
+    if let Some(b) = &layer.b_k {
+        add_bias_broadcast(&mut k, b, cfg.kv_dim());
+    }
+    if let Some(b) = &layer.b_v {
+        add_bias_broadcast(&mut v, b, cfg.kv_dim());
+    }
 
     // 3. RoPE on q and k at the current position
     rope_in_place(
@@ -452,11 +485,11 @@ impl Model {
             self.config.max_seq,
         );
 
-        let mut cache = KvCache::new(
-            self.config.n_layers,
-            self.config.max_seq,
-            self.config.layer.kv_dim(),
-        );
+        // Size the cache to exactly what this run needs, not the model's
+        // declared `max_seq` (Qwen2 ships max_seq = 32K which would allocate
+        // hundreds of MB for nothing).
+        let needed = prompt.len() + max_new;
+        let mut cache = KvCache::new(self.config.n_layers, needed, self.config.layer.kv_dim());
 
         // Prefill: feed each prompt token through the decode path so the cache
         // is populated. The last call's logits become our first predictor.
@@ -532,6 +565,9 @@ mod tests {
             w_gate: mk(ff * h),
             w_up: mk(ff * h),
             w_down: mk(h * ff),
+            b_q: None,
+            b_k: None,
+            b_v: None,
         }
     }
 

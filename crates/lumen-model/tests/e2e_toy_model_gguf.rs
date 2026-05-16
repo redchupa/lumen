@@ -238,6 +238,9 @@ fn small_random_model(seed: u64) -> Model {
             w_gate: mk_vec(&mut next, ff * h),
             w_up: mk_vec(&mut next, ff * h),
             w_down: mk_vec(&mut next, h * ff),
+            b_q: None,
+            b_k: None,
+            b_v: None,
         });
     }
     Model {

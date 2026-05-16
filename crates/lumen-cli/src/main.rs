@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use lumen_codegen::emit_c;
 use lumen_dsl::{render_all, Parser, TypeChecker};
 use lumen_ir::{lower, print_module, verify_module};
+use lumen_model::{GgufFile, KvValue};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -16,6 +17,7 @@ fn main() -> ExitCode {
         Some("check") => cmd_check(&args),
         Some("ir") => cmd_ir(&args),
         Some("compile-c") => cmd_compile_c(&args),
+        Some("inspect") => cmd_inspect(&args),
         Some("run") => {
             eprintln!("lumen run: not implemented yet (Phase 6)");
             ExitCode::from(2)
@@ -42,6 +44,7 @@ fn print_usage() {
     println!("  lumen check     <input.lum>             Lex + parse + type-check");
     println!("  lumen ir        <input.lum>             Dump IR (after lowering + verify)");
     println!("  lumen compile-c <input.lum> -o <out.c>  Emit C source from IR");
+    println!("  lumen inspect   <model.gguf>            Dump GGUF metadata + tensor table");
     println!("  lumen run       <model.gguf> <prompt>   (Phase 6)");
     println!("  lumen bench     <model.gguf>            (Phase 7)");
     println!("  lumen --version");
@@ -133,6 +136,73 @@ fn cmd_ir(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     print!("{}", print_module(&ir));
+    ExitCode::SUCCESS
+}
+
+fn cmd_inspect(args: &[String]) -> ExitCode {
+    let Some(path) = args.get(2) else {
+        eprintln!("usage: lumen inspect <model.gguf>");
+        return ExitCode::from(2);
+    };
+    let file = match GgufFile::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+
+    println!("=== {} ===", path);
+    println!("alignment: {}", file.alignment());
+    println!("tensors:   {}", file.tensors().len());
+    println!("kv pairs:  {}", file.metadata().len());
+
+    println!("\n--- metadata ---");
+    let mut keys: Vec<&String> = file.metadata().keys().collect();
+    keys.sort();
+    for k in keys {
+        let v = &file.metadata()[k];
+        let preview = match v {
+            KvValue::U8(x) => format!("u8 {}", x),
+            KvValue::I8(x) => format!("i8 {}", x),
+            KvValue::U16(x) => format!("u16 {}", x),
+            KvValue::I16(x) => format!("i16 {}", x),
+            KvValue::U32(x) => format!("u32 {}", x),
+            KvValue::I32(x) => format!("i32 {}", x),
+            KvValue::F32(x) => format!("f32 {}", x),
+            KvValue::U64(x) => format!("u64 {}", x),
+            KvValue::I64(x) => format!("i64 {}", x),
+            KvValue::F64(x) => format!("f64 {}", x),
+            KvValue::Bool(x) => format!("bool {}", x),
+            KvValue::String(s) => {
+                if s.len() > 80 {
+                    format!("string len={} \"{}...\"", s.len(), &s[..77])
+                } else {
+                    format!("string \"{}\"", s)
+                }
+            }
+            KvValue::Array(t, raw) => format!("array<{:?}> {} bytes", t, raw.len()),
+        };
+        println!("  {} = {}", k, preview);
+    }
+
+    println!("\n--- tensors ---");
+    for info in file.tensors() {
+        let dims_str = info
+            .dims
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "  {:50} {:?} [{}] -> {} bytes",
+            info.name,
+            info.dtype,
+            dims_str,
+            info.byte_size()
+        );
+    }
+
     ExitCode::SUCCESS
 }
 

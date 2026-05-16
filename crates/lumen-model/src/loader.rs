@@ -189,6 +189,14 @@ pub fn model_from_gguf(file: &GgufFile, arch: &str) -> Result<Model, GgufError> 
     let mut layers = Vec::with_capacity(n_layers);
     for i in 0..n_layers {
         let p = format!("blk.{}", i);
+        // Bias tensors are optional — only present in Qwen2/Qwen2.5.
+        let optional_bias = |name: &str| -> Option<Vec<f32>> {
+            match tensor_to_f32(file, name) {
+                Ok(v) => Some(v),
+                Err(GgufError::NoSuchTensor(_)) => None,
+                Err(_) => None, // unsupported dtype → treat as missing; surfaces later as wrong-shape error
+            }
+        };
         layers.push(LayerWeights {
             attn_norm_w: tensor_to_f32(file, &format!("{}.attn_norm.weight", p))?,
             wq: tensor_to_f32(file, &format!("{}.attn_q.weight", p))?,
@@ -199,6 +207,9 @@ pub fn model_from_gguf(file: &GgufFile, arch: &str) -> Result<Model, GgufError> 
             w_gate: tensor_to_f32(file, &format!("{}.ffn_gate.weight", p))?,
             w_up: tensor_to_f32(file, &format!("{}.ffn_up.weight", p))?,
             w_down: tensor_to_f32(file, &format!("{}.ffn_down.weight", p))?,
+            b_q: optional_bias(&format!("{}.attn_q.bias", p)),
+            b_k: optional_bias(&format!("{}.attn_k.bias", p)),
+            b_v: optional_bias(&format!("{}.attn_v.bias", p)),
         });
     }
 
