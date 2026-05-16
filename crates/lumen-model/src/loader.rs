@@ -21,30 +21,77 @@
 //! arch string as a parameter (look it up yourself via
 //! `file.metadata().get("general.architecture")`).
 //!
-//! Phase 6.F.1 scope: F32 weights only. Quantized weights (Q4_0/Q8_0/...) are
-//! returned with the appropriate `GgufError::UnsupportedTensorType` until
-//! Phase 6.F.2 wires the dequantization pipeline in.
+//! As of Phase 6.F.2.a this loader handles F32, F16, Q8_0, and Q4_0 by
+//! dequantizing through the references in `lumen_runtime::quant`.
+//! All Model weights are stored as fp32 at runtime.
 
+use lumen_runtime::quant::{
+    dequantize_q4_0, dequantize_q8_0, f16_bits_to_f32, BlockQ4_0, BlockQ8_0, QK,
+};
 use lumen_runtime::{LayerConfig, LayerWeights, Model, ModelConfig};
 
 use crate::gguf::{GgmlType, GgufError, GgufFile, KvValue};
 
-/// Decode a GGUF-stored tensor's raw bytes into an `f32` vector. Only handles
-/// `GgmlType::F32` here; quantized formats land in Phase 6.F.2.
+/// Decode a GGUF-stored tensor's raw bytes into an `f32` vector.
+///
+/// Handles:
+/// - F32: zero-copy reinterpretation.
+/// - F16: per-element fp16 → fp32 conversion.
+/// - Q8_0: block dequant (34 bytes per 32 elements).
+/// - Q4_0: block dequant (18 bytes per 32 elements, nibble-packed).
+///
+/// Any other dtype surfaces as `UnsupportedTensorType`.
 fn tensor_to_f32(file: &GgufFile, name: &str) -> Result<Vec<f32>, GgufError> {
     let info = file
         .tensor(name)
         .ok_or_else(|| GgufError::NoSuchTensor(name.to_string()))?;
-    if info.dtype != GgmlType::F32 {
-        return Err(GgufError::UnsupportedTensorType(info.dtype as u32));
-    }
     let bytes = file.tensor_data(name)?;
-    debug_assert_eq!(bytes.len() % 4, 0);
-    let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+
+    match info.dtype {
+        GgmlType::F32 => {
+            debug_assert_eq!(bytes.len() % 4, 0);
+            let mut out = Vec::with_capacity(bytes.len() / 4);
+            for chunk in bytes.chunks_exact(4) {
+                out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            Ok(out)
+        }
+        GgmlType::F16 => {
+            debug_assert_eq!(bytes.len() % 2, 0);
+            let mut out = Vec::with_capacity(bytes.len() / 2);
+            for chunk in bytes.chunks_exact(2) {
+                let bits = u16::from_le_bytes(chunk.try_into().unwrap());
+                out.push(f16_bits_to_f32(bits));
+            }
+            Ok(out)
+        }
+        GgmlType::Q8_0 => {
+            debug_assert_eq!(bytes.len() % 34, 0);
+            let n_blocks = bytes.len() / 34;
+            let nelem = info.element_count() as usize;
+            debug_assert_eq!(nelem, n_blocks * QK);
+            // SAFETY: `BlockQ8_0` is `repr(C, packed)` and exactly 34 bytes;
+            // the GGUF payload is a contiguous run of those same blocks.
+            let blocks: &[BlockQ8_0] =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const BlockQ8_0, n_blocks) };
+            let mut out = vec![0.0f32; nelem];
+            dequantize_q8_0(blocks, &mut out);
+            Ok(out)
+        }
+        GgmlType::Q4_0 => {
+            debug_assert_eq!(bytes.len() % 18, 0);
+            let n_blocks = bytes.len() / 18;
+            let nelem = info.element_count() as usize;
+            debug_assert_eq!(nelem, n_blocks * QK);
+            // SAFETY: `BlockQ4_0` is `repr(C, packed)` and exactly 18 bytes.
+            let blocks: &[BlockQ4_0] =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const BlockQ4_0, n_blocks) };
+            let mut out = vec![0.0f32; nelem];
+            dequantize_q4_0(blocks, &mut out);
+            Ok(out)
+        }
+        other => Err(GgufError::UnsupportedTensorType(other as u32)),
     }
-    Ok(out)
 }
 
 fn get_u32(file: &GgufFile, key: &str) -> Result<u32, GgufError> {
