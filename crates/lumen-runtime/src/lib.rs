@@ -4,11 +4,13 @@
 
 pub mod dispatch;
 pub mod kvcache;
+pub mod model;
 pub mod ops;
 pub mod pool;
 pub mod quant;
 pub mod tensor;
 
+pub use model::{forward_layer, multi_head_attention, LayerConfig, LayerWeights};
 pub use ops::{mul_in_place, rms_norm, rope_in_place, silu_in_place, softmax_rows};
 
 pub use quant::{
