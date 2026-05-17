@@ -682,7 +682,12 @@ pub fn forward_layer_decode_jit(
     );
 
     // 2. Q/K/V projection through JIT (per-weight storage dispatch), plus
-    //    optional biases.
+    //    optional biases. (Phase 7.M added a Q8×Q8 fused kernel + activation
+    //    quantization pipeline behind `weight_matmul_jit_storage_q8act`; it
+    //    netted neutral on AVX2-only — down_matmul's 152-block-per-row
+    //    dependency chain regressed +26% while shorter-K matmuls improved.
+    //    Leaving the production path on the Q8×F32 4-acc kernel until
+    //    AVX-VNNI `vpdpbusd` makes the int chain actually win.)
     let mut q = weight_matmul_jit_storage(&x_norm, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
     let mut k = weight_matmul_jit_storage(&x_norm, &layer.wk, cfg.hidden, cfg.kv_dim(), jit);
     let mut v = weight_matmul_jit_storage(&x_norm, &layer.wv, cfg.hidden, cfg.kv_dim(), jit);

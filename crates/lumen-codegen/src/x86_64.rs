@@ -15,9 +15,14 @@
 use crate::avx2_enc::{
     vaddps_reg, vaddss_xmm, vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm,
     vcvtsi2ss_xmm_r32, vdivss_xmm, vextractf128_xmm, vfmadd231ps_mem, vfmadd231ps_reg, vhaddps_ymm,
-    vmovd_load, vmovups_load, vmovups_store, vmulps_reg, vmulss_xmm, vpmovsxbd_load, vsqrtss_xmm,
+    vmovd_load, vmovdqu_load, vmovups_load, vmovups_store, vmulps_reg, vmulss_xmm, vpcmpeqd_reg,
+    vpmaddubsw_reg, vpmaddwd_reg, vpmovsxbd_load, vpsignb_reg, vpsrlw_imm8, vsqrtss_xmm,
     vxorps_zero, Ymm,
 };
+// Note: vpaddd_reg is exported but not used in any kernel yet (it was added
+// alongside the other AVX2 integer ops in Phase 7.M for future kernels).
+#[allow(unused_imports)]
+use crate::avx2_enc::vpaddd_reg;
 use crate::backend::{Backend, Capabilities, CodegenError, CodegenOpts, MachineCode};
 use crate::emit::Emitter;
 use crate::x86_64_enc::*;
@@ -510,21 +515,88 @@ fn emit_function_quant_matmul_q8(
     abi: Abi,
 ) -> Result<(), CodegenError> {
     // Locate the ops and verify the pattern.
-    let dq_idx = f
+    let dq_indices: Vec<usize> = f
         .values
         .iter()
-        .position(|v| matches!(v.op, Op::Dequantize { .. }))
-        .unwrap();
+        .enumerate()
+        .filter_map(|(i, v)| matches!(v.op, Op::Dequantize { .. }).then_some(i))
+        .collect();
     let mm_idx = f
         .values
         .iter()
         .position(|v| matches!(v.op, Op::MatMul { .. }))
         .ok_or(CodegenError::UnsupportedOp("missing matmul".into()))?;
 
-    let Op::Dequantize { x: dq_src } = f.values[dq_idx].op else {
+    let Op::MatMul { lhs, rhs } = f.values[mm_idx].op else {
         unreachable!()
     };
-    let Op::MatMul { lhs, rhs } = f.values[mm_idx].op else {
+
+    // Pattern dispatch:
+    //   1 Dequantize on LHS, F32 RHS  → Phase 5.C / 5.C-N=1 (Q8 × F32)
+    //   2 Dequantize on both sides    → Phase 7.M (Q8 × Q8 int dot)
+    let q8q8 = dq_indices.len() == 2
+        && lhs == lumen_ir::ValueId(dq_indices[0] as u32)
+        && rhs == lumen_ir::ValueId(dq_indices[1] as u32);
+
+    if q8q8 {
+        // Q8 × Q8 fused matmul (Phase 7.M).
+        let Op::Dequantize { x: w_src } = f.values[dq_indices[0]].op else {
+            unreachable!()
+        };
+        let Op::Dequantize { x: a_src } = f.values[dq_indices[1]].op else {
+            unreachable!()
+        };
+        let w_ty = f.values[w_src.0 as usize].ty.clone();
+        let a_ty = f.values[a_src.0 as usize].ty.clone();
+        if w_ty.dtype != DType::Q8_0 || a_ty.dtype != DType::Q8_0 {
+            return Err(CodegenError::UnsupportedOp(
+                "Phase 7.M: Q8×Q8 path requires both operands Q8_0".into(),
+            ));
+        }
+        let (m, k) = static_2d(&w_ty)?;
+        let (k_a, n) = static_2d(&a_ty)?;
+        if k != k_a {
+            return Err(CodegenError::ShapeError(
+                "Phase 7.M: matmul inner-dim mismatch".into(),
+            ));
+        }
+        if k % 32 != 0 {
+            return Err(CodegenError::ShapeError(
+                "Phase 7.M: K must be a multiple of 32 (Q8_0 block size)".into(),
+            ));
+        }
+        if n != 1 {
+            return Err(CodegenError::ShapeError(
+                "Phase 7.M: only N=1 (decode) Q8×Q8 kernel implemented".into(),
+            ));
+        }
+        let w_param = match f.values[w_src.0 as usize].op {
+            Op::Param { index } => index,
+            _ => {
+                return Err(CodegenError::UnsupportedOp(
+                    "Q8×Q8 weight source must be Param".into(),
+                ))
+            }
+        };
+        let a_param = match f.values[a_src.0 as usize].op {
+            Op::Param { index } => index,
+            _ => {
+                return Err(CodegenError::UnsupportedOp(
+                    "Q8×Q8 activation source must be Param".into(),
+                ))
+            }
+        };
+        let p_w = abi.param_reg(w_param);
+        let p_a = abi.param_reg(a_param);
+        let p_out = abi.param_reg(f.params.len() as u32);
+        emit_quant_matmul_q8q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+        return Ok(());
+    }
+
+    // Single-Dequantize path (Phase 5.C and 5.C-N=1).
+    let dq_idx = dq_indices.first().copied().unwrap();
+
+    let Op::Dequantize { x: dq_src } = f.values[dq_idx].op else {
         unreachable!()
     };
 
@@ -886,6 +958,154 @@ fn emit_quant_matmul_q8_n1_body(
     vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
 
     // movss [r14 + r15*4], xmm0
+    movss_store(em, Xmm(0), Reg::R14, Some((Reg::R15, Scale::S4)), 0);
+
+    inc_r(em, Reg::R15);
+    let jmp_i = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_i, i_loop);
+
+    let i_done = em.len();
+    patch_rel32(em, jge_i, i_done);
+
+    // ---- epilogue ----
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// Q8 weights × Q8 activations fused matmul, N=1 specialization.
+///
+/// Phase 7.M: this is the same shape as `emit_quant_matmul_q8_n1_body` but
+/// the activations come in pre-quantized as Q8_0 blocks, so the inner
+/// dot product can run in the integer domain instead of dequantizing per
+/// block to fp32.
+///
+/// Per Q8 block of (32 weight i8s + 32 activation i8s):
+/// ```text
+///   load 32 i8 weights into ymm1
+///   load 32 i8 acts    into ymm2
+///   ymm3 = vpsignb(ymm1, ymm1)         ; |weight|         (u8)
+///   ymm2 = vpsignb(ymm2, ymm1)         ; act * sign(w)   (i8)
+///   ymm3 = vpmaddubsw(ymm3, ymm2)      ; 16 i16 pair-sums of u8 × i8
+///   ymm3 = vpmaddwd(ymm3, ymm_ones16)  ; 8 i32 pair-sums of i16 × 1
+///   ymm3 = vcvtdq2ps(ymm3)             ; 8 fp32 lanes (= int8 dot, partial)
+///   scale = fp16_to_fp32(d_w) * fp16_to_fp32(d_a)   ; scalar
+///   ymm4 = vbroadcastss(scale)
+///   ymm0 = vfmadd231ps(ymm0, ymm3, ymm4)            ; fp32 row acc += scaled
+/// ```
+/// Per row epilogue: horizontal-sum ymm0 -> scalar, movss out[i].
+///
+/// Register plan (Win64-safe: ymm0..ymm5 only):
+///   ymm0 = fp32 row accumulator
+///   ymm1 = weight i8 vector (temp)
+///   ymm2 = act i8 vector (temp), then sign-corrected
+///   ymm3 = |w| / prod16 / prod32 / fp32 prod (temp)
+///   ymm4 = d_w*d_a broadcast (temp)
+///   ymm5 = ones16 constant (live across all rows; forged at function entry)
+#[allow(clippy::too_many_arguments)]
+fn emit_quant_matmul_q8q8_n1_body(
+    em: &mut Emitter,
+    p_w: Reg,
+    p_a: Reg,
+    p_out: Reg,
+    m: i32,
+    k: i32,
+    abi: Abi,
+) {
+    let k_blocks = k / 32;
+    let row_w_bytes = k_blocks * 34;
+
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_w);
+    mov_rr(em, Reg::R13, p_a);
+    mov_rr(em, Reg::R14, p_out);
+
+    // Forge a 16-lane i16(1) constant in ymm5:
+    //   vpcmpeqd ymm5,ymm5,ymm5 → all bits set (= -1 in every i32 lane)
+    //   vpsrlw   ymm5, ymm5, 15 → each i16 lane = 0x0001
+    // Stays in ymm5 for the entire function (no spills needed).
+    vpcmpeqd_reg(em, Ymm(5), Ymm(5), Ymm(5));
+    vpsrlw_imm8(em, Ymm(5), Ymm(5), 15);
+
+    // R15 = i (output row), R11 = kb (block index).
+    xor_rr(em, Reg::R15);
+    let i_loop = em.len();
+    cmp_ri32(em, Reg::R15, m);
+    let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // fp32 row accumulator (8 lanes).
+    vxorps_zero(em, Ymm(0));
+
+    xor_rr(em, Reg::R11);
+    let kb_loop = em.len();
+    cmp_ri32(em, Reg::R11, k_blocks);
+    let jge_kb = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // RAX = i*row_w_bytes + kb*34   (weight block byte offset)
+    mov_rr(em, Reg::RAX, Reg::R15);
+    imul_rri32(em, Reg::RAX, Reg::RAX, row_w_bytes);
+    mov_rr(em, Reg::RDX, Reg::R11);
+    imul_rri32(em, Reg::RDX, Reg::RDX, 34);
+    add_rr(em, Reg::RAX, Reg::RDX);
+
+    // R10 = kb*34   (act block byte offset)
+    mov_rr(em, Reg::R10, Reg::R11);
+    imul_rri32(em, Reg::R10, Reg::R10, 34);
+
+    // Load 32 i8 weight bytes (skip 2-byte d header) and 32 i8 act bytes.
+    vmovdqu_load(em, Ymm(1), Reg::R12, Some((Reg::RAX, Scale::S1)), 2);
+    vmovdqu_load(em, Ymm(2), Reg::R13, Some((Reg::R10, Scale::S1)), 2);
+
+    // vpsignb trick: |w| (u8) and a*sign(w) (i8) for the u8×i8 maddubsw.
+    vpsignb_reg(em, Ymm(3), Ymm(1), Ymm(1));
+    vpsignb_reg(em, Ymm(2), Ymm(2), Ymm(1));
+
+    // 32 (u8 × i8) → 16 i16 pair-sums.
+    vpmaddubsw_reg(em, Ymm(3), Ymm(3), Ymm(2));
+    // 16 i16 × 1 → 8 i32 pair-sums (effectively 4-wide reduction).
+    vpmaddwd_reg(em, Ymm(3), Ymm(3), Ymm(5));
+    // i32 → fp32 (8 lanes).
+    vcvtdq2ps(em, Ymm(3), Ymm(3));
+
+    // Compute d_w * d_a as a scalar fp32, broadcast to ymm4.
+    //   ymm1 = fp16(d_w), then xmm1 = fp32(d_w)
+    //   ymm2 = fp16(d_a), then xmm2 = fp32(d_a)
+    //   xmm1 = xmm1 * xmm2 (scalar)
+    //   ymm4 = broadcast(xmm1)
+    vmovd_load(em, Ymm(1), Reg::R12, Some((Reg::RAX, Scale::S1)), 0);
+    vcvtph2ps_xmm(em, Ymm(1), Ymm(1));
+    vmovd_load(em, Ymm(2), Reg::R13, Some((Reg::R10, Scale::S1)), 0);
+    vcvtph2ps_xmm(em, Ymm(2), Ymm(2));
+    vmulss_xmm(em, Ymm(1), Ymm(1), Ymm(2));
+    vbroadcastss_xmm(em, Ymm(4), Ymm(1));
+
+    // ymm0 += ymm3 * ymm4
+    vfmadd231ps_reg(em, Ymm(0), Ymm(3), Ymm(4));
+
+    inc_r(em, Reg::R11);
+    let jmp_kb = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_kb, kb_loop);
+
+    let kb_done = em.len();
+    patch_rel32(em, jge_kb, kb_done);
+
+    // Horizontal reduce ymm0 (8 fp32 lanes) -> scalar in xmm0[0], store.
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vextractf128_xmm(em, Ymm(1), Ymm(0), 1);
+    vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
     movss_store(em, Xmm(0), Reg::R14, Some((Reg::R15, Scale::S4)), 0);
 
     inc_r(em, Reg::R15);

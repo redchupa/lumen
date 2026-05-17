@@ -27,20 +27,26 @@ use crate::exec::{ExecError, ExecRegion};
 pub struct MatmulJitCache {
     entries: HashMap<(u32, u32, u32), ExecRegion>,
     q8_entries: HashMap<(u32, u32, u32), ExecRegion>,
+    q8q8_entries: HashMap<(u32, u32, u32), ExecRegion>,
 }
 
 /// Function signature emitted by `lumen_codegen::x86_64` for matmul.
 pub type MatmulFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32);
 
-/// Function signature for the Q8_0 × F32 fused matmul kernel.
+/// Function signature for the Q8_0 weight × F32 activation fused matmul kernel.
 /// First argument is the raw Q8_0 block buffer (`*const u8`).
 pub type Q8MatmulFn = unsafe extern "C" fn(*const u8, *const f32, *mut f32);
+
+/// Function signature for the Q8_0 weight × Q8_0 activation fused matmul kernel.
+/// Both inputs are raw Q8_0 block buffers (`*const u8`).
+pub type Q8Q8MatmulFn = unsafe extern "C" fn(*const u8, *const u8, *mut f32);
 
 impl MatmulJitCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
             q8_entries: HashMap::new(),
+            q8q8_entries: HashMap::new(),
         }
     }
 
@@ -89,6 +95,30 @@ impl MatmulJitCache {
         // Q8 fused IR pattern (Param Q8 + Param F32 + Dequantize + MatMul +
         // Return), which emits a `Q8MatmulFn`-signature function.
         Ok(unsafe { region.as_fn::<Q8MatmulFn>() })
+    }
+
+    /// Number of Q8×Q8 fused kernels currently cached.
+    pub fn q8q8_len(&self) -> usize {
+        self.q8q8_entries.len()
+    }
+
+    /// Returns a cached fused Q8_0×Q8_0 kernel of shape
+    /// `(weights[M, K]: q8_0) @ (activations[K, 1]: q8_0) → (out[M, 1]: f32)`.
+    /// Constraints: `K % 32 == 0`. Only `N == 1` (decode) is supported.
+    /// Phase 7.M.
+    pub fn get_or_compile_q8q8(&mut self, m: u32, k: u32) -> Result<Q8Q8MatmulFn, JitError> {
+        let key = (m, k, 1);
+        let region = match self.q8q8_entries.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let compiled = compile_q8q8_matmul(m, k)?;
+                v.insert(compiled)
+            }
+        };
+        // SAFETY: the region was produced by `lumen_codegen::x86_64` via the
+        // Q8×Q8 fused IR pattern (Param Q8 + Param Q8 + 2× Dequantize +
+        // MatMul + Return), which emits a `Q8Q8MatmulFn`-signature function.
+        Ok(unsafe { region.as_fn::<Q8Q8MatmulFn>() })
     }
 }
 
@@ -159,6 +189,79 @@ fn compile_q8_matmul(m: u32, k: u32, n: u32) -> Result<ExecRegion, JitError> {
 
     let ir = IrModule { functions: vec![f] };
 
+    let backend = X86_64::host();
+    let mc = backend
+        .lower(&ir, &CodegenOpts::default())
+        .map_err(|e| JitError::Codegen(format!("{:?}", e)))?;
+    let region = ExecRegion::from_machine_code(&mc)?;
+    Ok(region)
+}
+
+/// Build the IR for a Q8×Q8 fused matmul (N=1 decode) and JIT-compile it.
+/// IR pattern (recognized by `emit_function_quant_matmul_q8`):
+/// ```text
+///   v0 = Param(0) : tensor<q8_0, [M, K]>     # weights
+///   v1 = Param(1) : tensor<q8_0, [K, 1]>     # activations (pre-quantized)
+///   v2 = Dequantize v0 : tensor<f32, [M, K]>
+///   v3 = Dequantize v1 : tensor<f32, [K, 1]>
+///   v4 = MatMul v2, v3 : tensor<f32, [M, 1]>
+///   return v4
+/// ```
+fn compile_q8q8_matmul(m: u32, k: u32) -> Result<ExecRegion, JitError> {
+    let n = 1u32;
+    let w_ty = TensorType {
+        dtype: DType::Q8_0,
+        shape: Shape(vec![Dim::Static(m), Dim::Static(k)]),
+    };
+    let a_ty = TensorType {
+        dtype: DType::Q8_0,
+        shape: Shape(vec![Dim::Static(k), Dim::Static(n)]),
+    };
+    let dq_w_ty = TensorType {
+        dtype: DType::F32,
+        shape: Shape(vec![Dim::Static(m), Dim::Static(k)]),
+    };
+    let dq_a_ty = TensorType {
+        dtype: DType::F32,
+        shape: Shape(vec![Dim::Static(k), Dim::Static(n)]),
+    };
+    let c_ty = TensorType {
+        dtype: DType::F32,
+        shape: Shape(vec![Dim::Static(m), Dim::Static(n)]),
+    };
+
+    let mut f = Function::new(
+        "q8q8_matmul",
+        vec![w_ty.clone(), a_ty.clone()],
+        c_ty.clone(),
+    );
+    let w = f.param_values[0];
+    let a = f.param_values[1];
+    let dq_w = f.push(Value {
+        op: Op::Dequantize { x: w },
+        ty: dq_w_ty,
+    });
+    let dq_a = f.push(Value {
+        op: Op::Dequantize { x: a },
+        ty: dq_a_ty,
+    });
+    let prod = f.push(Value {
+        op: Op::MatMul {
+            lhs: dq_w,
+            rhs: dq_a,
+        },
+        ty: c_ty,
+    });
+    let placeholder = TensorType {
+        dtype: DType::F32,
+        shape: Shape(vec![]),
+    };
+    f.push(Value {
+        op: Op::Return { value: prod },
+        ty: placeholder,
+    });
+
+    let ir = IrModule { functions: vec![f] };
     let backend = X86_64::host();
     let mc = backend
         .lower(&ir, &CodegenOpts::default())
@@ -390,6 +493,88 @@ mod tests {
         }
         // Cache should hold one Q8 entry per distinct shape.
         assert_eq!(cache.q8_len(), 7);
+    }
+
+    /// Phase 7.M: Q8 weights × Q8 activations fused matmul kernel (N=1).
+    /// Validates that the int-dot path agrees with dequant-both-then-naive
+    /// across decode-relevant shapes.
+    #[test]
+    fn q8q8_n1_kernel_matches_dequant_both_then_naive() {
+        use lumen_runtime::quant::{dequantize_q8_0, quantize_q8_0, BlockQ8_0};
+
+        let mut cache = MatmulJitCache::new();
+        for &(m, k) in &[
+            (8u32, 32),
+            (16, 64),
+            (32, 128),
+            (7, 256),    // odd M
+            (896, 896),  // Qwen wq/wo shape
+            (4864, 896), // Qwen FFN gate/up
+            (128, 4864), // Qwen FFN down (small M, large K)
+        ] {
+            // Random-ish but deterministic source values, kept in a range
+            // where Q8 quantization round-trips reasonably (max ≲ 1).
+            let wts_f32: Vec<f32> = (0..(m * k) as usize)
+                .map(|i| (((i % 17) as f32) - 8.0) * 0.07)
+                .collect();
+            let acts_f32: Vec<f32> = (0..k as usize)
+                .map(|i| (((i % 13) as f32) - 6.0) * 0.04)
+                .collect();
+
+            // Quantize both, then dequantize for the reference matmul so the
+            // test compares apples-to-apples (Q8-quantized inputs).
+            let mut wts_q8 = vec![
+                BlockQ8_0 {
+                    d: 0,
+                    qs: [0i8; 32]
+                };
+                (m * k / 32) as usize
+            ];
+            quantize_q8_0(&wts_f32, &mut wts_q8);
+            let mut acts_q8 = vec![
+                BlockQ8_0 {
+                    d: 0,
+                    qs: [0i8; 32]
+                };
+                (k / 32) as usize
+            ];
+            quantize_q8_0(&acts_f32, &mut acts_q8);
+
+            let mut wts_dq = vec![0.0f32; (m * k) as usize];
+            dequantize_q8_0(&wts_q8, &mut wts_dq);
+            let mut acts_dq = vec![0.0f32; k as usize];
+            dequantize_q8_0(&acts_q8, &mut acts_dq);
+
+            let want = naive(&wts_dq, &acts_dq, m as usize, k as usize, 1);
+
+            let f = cache
+                .get_or_compile_q8q8(m, k)
+                .unwrap_or_else(|e| panic!("compile q8q8 ({},{}): {}", m, k, e));
+            let mut out = vec![0.0f32; m as usize];
+            // SAFETY: kernel was just compiled for this exact (m, k, 1) Q8×Q8 shape.
+            unsafe {
+                f(
+                    wts_q8.as_ptr() as *const u8,
+                    acts_q8.as_ptr() as *const u8,
+                    out.as_mut_ptr(),
+                )
+            };
+
+            let tol = 1e-3 * (k as f32).sqrt();
+            for (idx, (g, w)) in out.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() < tol,
+                    "shape ({},{},1) row {}: {} vs {} (tol {})",
+                    m,
+                    k,
+                    idx,
+                    g,
+                    w,
+                    tol
+                );
+            }
+        }
+        assert_eq!(cache.q8q8_len(), 7);
     }
 
     #[test]

@@ -501,6 +501,165 @@ pub fn vmulss_xmm(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
     em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
 }
 
+// ============================================================================
+// AVX2 integer ops (Phase 7.M — Q8-native int dot product)
+// ============================================================================
+
+/// `vmovdqu ymm, [base + index*scale + disp32]` — 256-bit unaligned integer
+/// load. Same data path as `vmovups` on modern silicon but signals "integer"
+/// to the rename engine; avoids the FP/INT bypass penalty when followed by
+/// integer SIMD ops.
+///
+/// Encoding: VEX.256.F3.0F.WIG 6F /r
+pub fn vmovdqu_load(em: &mut Emitter, dst: Ymm, base: Reg, index: Option<(Reg, Scale)>, disp: i32) {
+    let x = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    emit_vex(
+        em,
+        dst.high1(),
+        x,
+        base.high1(),
+        OpcodeMap::M0F,
+        0,
+        0,
+        1,
+        Prefix::PF3,
+    );
+    em.u8(0x6F);
+    emit_modrm_sib_disp32(em, dst.low3(), base, index, disp);
+}
+
+/// `vpsignb ymm_dst, ymm_src1, ymm_src2` — for each byte lane:
+///   if src2[i] < 0:  dst[i] = -src1[i]
+///   if src2[i] == 0: dst[i] = 0
+///   else:            dst[i] = src1[i]
+///
+/// Encoding: VEX.NDS.256.66.0F38.WIG 08 /r
+pub fn vpsignb_reg(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F38,
+        0,
+        src1.0,
+        1,
+        Prefix::P66,
+    );
+    em.u8(0x08);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vpmaddubsw ymm_dst, ymm_src1, ymm_src2` — multiply 32 (u8, i8) pairs and
+/// horizontally sum adjacent pairs into 16 saturated i16 lanes:
+///   dst_i16[i] = sat( src1_u8[2i]*src2_i8[2i] + src1_u8[2i+1]*src2_i8[2i+1] )
+///
+/// Note the asymmetry — `src1` is treated as unsigned bytes, `src2` as signed.
+///
+/// Encoding: VEX.NDS.256.66.0F38.WIG 04 /r
+pub fn vpmaddubsw_reg(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F38,
+        0,
+        src1.0,
+        1,
+        Prefix::P66,
+    );
+    em.u8(0x04);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vpmaddwd ymm_dst, ymm_src1, ymm_src2` — multiply 16 i16 pairs and sum
+/// adjacent pairs into 8 i32 lanes:
+///   dst_i32[i] = src1_i16[2i]*src2_i16[2i] + src1_i16[2i+1]*src2_i16[2i+1]
+///
+/// Encoding: VEX.NDS.256.66.0F.WIG F5 /r
+pub fn vpmaddwd_reg(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        1,
+        Prefix::P66,
+    );
+    em.u8(0xF5);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vpaddd ymm_dst, ymm_src1, ymm_src2` — element-wise i32 add (8 lanes).
+///
+/// Encoding: VEX.NDS.256.66.0F.WIG FE /r
+pub fn vpaddd_reg(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        1,
+        Prefix::P66,
+    );
+    em.u8(0xFE);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vpcmpeqd ymm_dst, ymm_src1, ymm_src2` — compare i32 lanes for equality,
+/// setting each result lane to all-1s (= -1) or all-0s. The known idiom
+/// `vpcmpeqd dst, dst, dst` produces an all-ones register cheaply (no input
+/// dependency on the comparison).
+///
+/// Encoding: VEX.NDS.256.66.0F.WIG 76 /r
+pub fn vpcmpeqd_reg(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
+    emit_vex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        1,
+        Prefix::P66,
+    );
+    em.u8(0x76);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vpsrlw ymm_dst, ymm_src, imm8` — logical shift right each i16 lane by imm
+/// bits. Used together with `vpcmpeqd self,self,self` to forge the 16-lane
+/// `1` constant: all-ones >> 15 = 0x0001 per i16 lane.
+///
+/// Encoding: VEX.NDD.256.66.0F.WIG 71 /2 ib
+/// (Note the /2 — the opcode extension goes in ModR/M.reg, and the
+/// destination YMM is encoded in vvvv, not in ModR/M.reg.)
+pub fn vpsrlw_imm8(em: &mut Emitter, dst: Ymm, src: Ymm, imm: u8) {
+    emit_vex(
+        em,
+        0, // ModR/M.reg is the /2 opcode extension, not a real reg
+        0,
+        src.high1(),
+        OpcodeMap::M0F,
+        0,
+        dst.0,
+        1,
+        Prefix::P66,
+    );
+    em.u8(0x71);
+    // mod=11, reg=/2, rm=src.low3
+    em.u8(0b11_000_000 | (2 << 3) | src.low3());
+    em.u8(imm);
+}
+
 // ---- shared ModR/M+SIB+disp32 emission ----------------------------------
 
 fn emit_modrm_sib_disp32(
@@ -673,5 +832,62 @@ mod tests {
         let bytes = enc(|e| vaddss_xmm(e, Ymm(0), Ymm(0), Ymm(0)));
         assert_eq!(bytes[0], 0xC5);
         assert!(bytes.contains(&0x58));
+    }
+
+    #[test]
+    fn encodes_vmovdqu_load() {
+        // `vmovdqu ymm0, [rdx + 0]` — F3.0F map, opcode 6F.
+        let bytes = enc(|e| vmovdqu_load(e, Ymm(0), Reg::RDX, None, 0));
+        assert!(bytes[0] == 0xC5 || bytes[0] == 0xC4);
+        assert!(bytes.contains(&0x6F));
+    }
+
+    #[test]
+    fn encodes_vpsignb_reg() {
+        // `vpsignb ymm0, ymm0, ymm0` — 66.0F38 map, opcode 08.
+        let bytes = enc(|e| vpsignb_reg(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert_eq!(bytes[0], 0xC4); // 3-byte VEX (0F 38 map)
+        assert!(bytes.contains(&0x08));
+    }
+
+    #[test]
+    fn encodes_vpmaddubsw_reg() {
+        // `vpmaddubsw ymm0, ymm0, ymm0` — 66.0F38 map, opcode 04.
+        let bytes = enc(|e| vpmaddubsw_reg(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert_eq!(bytes[0], 0xC4); // 3-byte VEX (0F 38 map)
+        assert!(bytes.contains(&0x04));
+    }
+
+    #[test]
+    fn encodes_vpmaddwd_reg() {
+        // `vpmaddwd ymm0, ymm0, ymm0` — 66.0F map, opcode F5.
+        let bytes = enc(|e| vpmaddwd_reg(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert!(bytes[0] == 0xC5 || bytes[0] == 0xC4);
+        assert!(bytes.contains(&0xF5));
+    }
+
+    #[test]
+    fn encodes_vpaddd_reg() {
+        // `vpaddd ymm0, ymm0, ymm0` — 66.0F map, opcode FE.
+        let bytes = enc(|e| vpaddd_reg(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert!(bytes[0] == 0xC5 || bytes[0] == 0xC4);
+        assert!(bytes.contains(&0xFE));
+    }
+
+    #[test]
+    fn encodes_vpcmpeqd_reg() {
+        // `vpcmpeqd ymm0, ymm0, ymm0` — 66.0F map, opcode 76.
+        let bytes = enc(|e| vpcmpeqd_reg(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert!(bytes[0] == 0xC5 || bytes[0] == 0xC4);
+        assert!(bytes.contains(&0x76));
+    }
+
+    #[test]
+    fn encodes_vpsrlw_imm8() {
+        // `vpsrlw ymm0, ymm0, 15` — 66.0F map, opcode 71 with /2 extension.
+        let bytes = enc(|e| vpsrlw_imm8(e, Ymm(0), Ymm(0), 15));
+        assert!(bytes[0] == 0xC5 || bytes[0] == 0xC4);
+        assert!(bytes.contains(&0x71));
+        assert_eq!(*bytes.last().unwrap(), 15);
     }
 }
