@@ -12,4 +12,3 @@ authors.workspace = true
 lumen-ir.workspace = true
 lumen-jit.workspace = true
 thiserror.workspace = true
-rayon.workspace = true

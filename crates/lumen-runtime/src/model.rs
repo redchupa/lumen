@@ -239,10 +239,8 @@ fn q8_matmul_dispatch(
     jit: &mut MatmulJitCache,
     out: &mut [f32],
 ) {
-    let nthreads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(8);
+    let pool = crate::threadpool::global();
+    let nthreads = pool.n_workers();
     let work_units = d_out * (d_in / 32);
 
     if work_units < MULTI_THREAD_WORK_THRESHOLD || nthreads <= 1 {
@@ -257,7 +255,7 @@ fn q8_matmul_dispatch(
         return;
     }
 
-    // Parallel path.
+    // Parallel path — one chunk per worker thread.
     let chunk_rows = d_out.div_ceil(nthreads);
     let n_chunks = d_out.div_ceil(chunk_rows);
     let last_rows = d_out - (n_chunks - 1) * chunk_rows;
@@ -277,40 +275,33 @@ fn q8_matmul_dispatch(
     let k_blocks = d_in / 32;
     let row_bytes = k_blocks * 34;
 
-    // SAFETY of the parallel loop:
-    // - `weights` is `&[BlockQ8_0]` so the slice is alive for the closure's borrow.
-    //   We compute a per-chunk pointer offset by `chunk_idx * chunk_rows * row_bytes`.
-    // - `a` is `&[f32]`, read-only, shared across threads — Send+Sync on `&[f32]`.
-    // - `out.par_chunks_mut` hands each closure a disjoint `&mut [f32]` slice;
-    //   no aliasing.
-    // - The function pointer is `Copy + Send + Sync` (it's `unsafe extern "C" fn`).
-    use rayon::prelude::*;
-    // Pass pointers across the thread boundary as `usize` (Send + Sync) and
-    // cast back inside each worker. Avoids needing a Send/Sync newtype around
-    // raw pointers in the closure's captured environment.
+    // Cast pointers to usize for cross-thread transport (raw pointers aren't
+    // Send/Sync). Tasks reconstruct typed pointers on the other side. SAFETY:
+    // each task reads/writes a disjoint row range, computed from chunk_idx.
     let weights_base_addr: usize = weights.as_ptr() as usize;
     let acts_base_addr: usize = a.as_ptr() as usize;
+    let out_base_addr: usize = out.as_mut_ptr() as usize;
 
-    out.par_chunks_mut(chunk_rows)
-        .enumerate()
-        .for_each(|(chunk_idx, out_chunk)| {
-            let actual_rows = out_chunk.len();
-            let fn_ptr = if actual_rows == chunk_rows {
-                f_reg
-            } else {
-                f_last
-            };
-            // SAFETY: pointer arithmetic stays within the original slice; each
-            // chunk reads `actual_rows * row_bytes` bytes starting at
-            // `chunk_idx * chunk_rows * row_bytes`. Caller guarantees the
-            // weights slice covers d_out * row_bytes bytes. The kernel was
-            // compiled for exactly `actual_rows`.
-            let w_ptr = (weights_base_addr + chunk_idx * chunk_rows * row_bytes) as *const u8;
-            let a_ptr = acts_base_addr as *const f32;
-            unsafe {
-                fn_ptr(w_ptr, a_ptr, out_chunk.as_mut_ptr());
-            }
-        });
+    pool.parallel_for(n_chunks, |chunk_idx| {
+        let row_start = chunk_idx * chunk_rows;
+        let actual_rows = (d_out - row_start).min(chunk_rows);
+        let fn_ptr = if actual_rows == chunk_rows {
+            f_reg
+        } else {
+            f_last
+        };
+        // SAFETY: pointer arithmetic stays within the original buffers;
+        // each chunk reads `actual_rows * row_bytes` bytes of weights starting
+        // at `row_start * row_bytes`, reads `d_in` activations (shared), and
+        // writes `actual_rows` floats to out at offset `row_start`. Output
+        // chunks are disjoint per chunk_idx.
+        let w_ptr = (weights_base_addr + row_start * row_bytes) as *const u8;
+        let a_ptr = acts_base_addr as *const f32;
+        let out_ptr = (out_base_addr + row_start * std::mem::size_of::<f32>()) as *mut f32;
+        unsafe {
+            fn_ptr(w_ptr, a_ptr, out_ptr);
+        }
+    });
 }
 
 /// Add `bias` broadcast across each row of `x` (shape `[rows, dim]`).

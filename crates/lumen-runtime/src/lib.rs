@@ -9,6 +9,7 @@ pub mod ops;
 pub mod pool;
 pub mod quant;
 pub mod tensor;
+pub mod threadpool;
 
 pub use kvcache::{KvCache, LayerKvCache};
 pub use model::{
