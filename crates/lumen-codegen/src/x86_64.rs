@@ -16,13 +16,33 @@ use crate::avx2_enc::{
     vaddps_reg, vaddss_xmm, vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm,
     vcvtsi2ss_xmm_r32, vdivss_xmm, vextractf128_xmm, vfmadd231ps_mem, vfmadd231ps_reg, vhaddps_ymm,
     vmovd_load, vmovdqu_load, vmovups_load, vmovups_store, vmulps_reg, vmulss_xmm, vpcmpeqd_reg,
-    vpmaddubsw_reg, vpmaddwd_reg, vpmovsxbd_load, vpsignb_reg, vpsrlw_imm8, vsqrtss_xmm,
-    vxorps_zero, Ymm,
+    vpdpbusd_evex_reg, vpdpbusd_vex_reg, vpmaddubsw_reg, vpmaddwd_reg, vpmovsxbd_load, vpsignb_reg,
+    vpsrlw_imm8, vsqrtss_xmm, vxorps_zero, Ymm,
 };
 // Note: vpaddd_reg is exported but not used in any kernel yet (it was added
 // alongside the other AVX2 integer ops in Phase 7.M for future kernels).
 #[allow(unused_imports)]
 use crate::avx2_enc::vpaddd_reg;
+
+/// Which VNNI encoding to use for `vpdpbusd`. Selected by the caller based
+/// on runtime CPU feature detection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VnniForm {
+    /// AVX-VNNI (Intel Tiger Lake / Alder Lake+). 5-byte VEX form.
+    Vex256,
+    /// AVX-512 VNNI (Skylake-X / SPR / Zen 4). 6-byte EVEX form, works on
+    /// any AVX-512 capable CPU even if the `avxvnni` CPUID bit is clear.
+    Evex256,
+}
+
+impl VnniForm {
+    fn emit(self, em: &mut Emitter, acc: Ymm, a: Ymm, b: Ymm) {
+        match self {
+            VnniForm::Vex256 => vpdpbusd_vex_reg(em, acc, a, b),
+            VnniForm::Evex256 => vpdpbusd_evex_reg(em, acc, a, b),
+        }
+    }
+}
 use crate::backend::{Backend, Capabilities, CodegenError, CodegenOpts, MachineCode};
 use crate::emit::Emitter;
 use crate::x86_64_enc::*;
@@ -98,13 +118,13 @@ impl Backend for X86_64 {
         Capabilities::default()
     }
 
-    fn lower(&self, ir: &IrModule, _opts: &CodegenOpts) -> Result<MachineCode, CodegenError> {
+    fn lower(&self, ir: &IrModule, opts: &CodegenOpts) -> Result<MachineCode, CodegenError> {
         let f = ir.functions.first().ok_or(CodegenError::UnsupportedOp(
             "module has no functions".into(),
         ))?;
 
         let mut em = Emitter::new();
-        emit_function(&mut em, f, self.abi, self.avx2)?;
+        emit_function(&mut em, f, self.abi, self.avx2, opts.vnni)?;
         Ok(MachineCode {
             bytes: em.buf,
             entry_offset: 0,
@@ -121,7 +141,13 @@ impl Backend for X86_64 {
 /// - matmul:       `Param, Param, MatMul, Return`                         (Phase 2.B/3)
 /// - dequant:      `Param, Dequantize, Return`                            (Phase 5.B)
 /// - rms norm:     `Param(f32, [H]), Param(f32, [H]), RmsNorm, Return`    (Phase 6.C.2)
-fn emit_function(em: &mut Emitter, f: &Function, abi: Abi, avx2: bool) -> Result<(), CodegenError> {
+fn emit_function(
+    em: &mut Emitter,
+    f: &Function,
+    abi: Abi,
+    avx2: bool,
+    vnni: Option<VnniForm>,
+) -> Result<(), CodegenError> {
     let has_rms = f.values.iter().any(|v| matches!(v.op, Op::RmsNorm { .. }));
     if has_rms {
         return emit_function_rms_norm(em, f, abi);
@@ -135,7 +161,7 @@ fn emit_function(em: &mut Emitter, f: &Function, abi: Abi, avx2: bool) -> Result
 
     // Pattern 1: dequant fused with matmul → on-the-fly quant matmul.
     if has_dequant && has_matmul {
-        return emit_function_quant_matmul_q8(em, f, abi);
+        return emit_function_quant_matmul_q8(em, f, abi, vnni);
     }
 
     // Pattern 2: standalone dequant.
@@ -513,6 +539,7 @@ fn emit_function_quant_matmul_q8(
     em: &mut Emitter,
     f: &Function,
     abi: Abi,
+    vnni: Option<VnniForm>,
 ) -> Result<(), CodegenError> {
     // Locate the ops and verify the pattern.
     let dq_indices: Vec<usize> = f
@@ -589,7 +616,11 @@ fn emit_function_quant_matmul_q8(
         let p_w = abi.param_reg(w_param);
         let p_a = abi.param_reg(a_param);
         let p_out = abi.param_reg(f.params.len() as u32);
-        emit_quant_matmul_q8q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+        if let Some(form) = vnni {
+            emit_quant_matmul_q8q8_n1_body_vnni(em, p_w, p_a, p_out, m as i32, k as i32, abi, form);
+        } else {
+            emit_quant_matmul_q8q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+        }
         return Ok(());
     }
 
@@ -1093,6 +1124,129 @@ fn emit_quant_matmul_q8q8_n1_body(
 
     // ymm0 += ymm3 * ymm4
     vfmadd231ps_reg(em, Ymm(0), Ymm(3), Ymm(4));
+
+    inc_r(em, Reg::R11);
+    let jmp_kb = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_kb, kb_loop);
+
+    let kb_done = em.len();
+    patch_rel32(em, jge_kb, kb_done);
+
+    // Horizontal reduce ymm0 (8 fp32 lanes) -> scalar in xmm0[0], store.
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vextractf128_xmm(em, Ymm(1), Ymm(0), 1);
+    vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
+    movss_store(em, Xmm(0), Reg::R14, Some((Reg::R15, Scale::S4)), 0);
+
+    inc_r(em, Reg::R15);
+    let jmp_i = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_i, i_loop);
+
+    let i_done = em.len();
+    patch_rel32(em, jge_i, i_done);
+
+    // ---- epilogue ----
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// Q8×Q8 fused matmul (N=1), VNNI variant. Same dataflow as
+/// `emit_quant_matmul_q8q8_n1_body` but the i8×i8-then-pair-sum chain
+/// (vpsignb → vpsignb → vpmaddubsw → vpmaddwd) collapses into one
+/// `vpdpbusd` per block, dropping the critical path from ~10 cycles to
+/// ~5 cycles per block.
+///
+/// vpdpbusd computes `acc_i32[i] += sum_4_pairs(u8 × i8)`, which is exactly
+/// the i16-pair-sum-then-i32-pair-sum the AVX2 chain was doing in two
+/// instructions. Caller still applies the vpsignb trick (|w| as u8, a*sign(w)
+/// as i8) to handle our signed×signed Q8 multiplication.
+///
+/// Register plan (Win64-safe: ymm0..ymm5 only). Note: the `ones16` constant
+/// used by the AVX2 path is no longer needed (vpdpbusd has the i16-pair-sum
+/// baked in), freeing one ymm.
+#[allow(clippy::too_many_arguments)]
+fn emit_quant_matmul_q8q8_n1_body_vnni(
+    em: &mut Emitter,
+    p_w: Reg,
+    p_a: Reg,
+    p_out: Reg,
+    m: i32,
+    k: i32,
+    abi: Abi,
+    vnni: VnniForm,
+) {
+    let k_blocks = k / 32;
+    let row_w_bytes = k_blocks * 34;
+
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_w);
+    mov_rr(em, Reg::R13, p_a);
+    mov_rr(em, Reg::R14, p_out);
+
+    // R15 = i (output row), R11 = kb (block index).
+    xor_rr(em, Reg::R15);
+    let i_loop = em.len();
+    cmp_ri32(em, Reg::R15, m);
+    let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // fp32 row accumulator (8 lanes).
+    vxorps_zero(em, Ymm(0));
+
+    xor_rr(em, Reg::R11);
+    let kb_loop = em.len();
+    cmp_ri32(em, Reg::R11, k_blocks);
+    let jge_kb = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // Block byte offsets.
+    mov_rr(em, Reg::RAX, Reg::R15);
+    imul_rri32(em, Reg::RAX, Reg::RAX, row_w_bytes);
+    mov_rr(em, Reg::RDX, Reg::R11);
+    imul_rri32(em, Reg::RDX, Reg::RDX, 34);
+    add_rr(em, Reg::RAX, Reg::RDX);
+
+    mov_rr(em, Reg::R10, Reg::R11);
+    imul_rri32(em, Reg::R10, Reg::R10, 34);
+
+    // Load weight bytes and act bytes (skip 2-byte d header).
+    vmovdqu_load(em, Ymm(1), Reg::R12, Some((Reg::RAX, Scale::S1)), 2);
+    vmovdqu_load(em, Ymm(2), Reg::R13, Some((Reg::R10, Scale::S1)), 2);
+
+    // |w| (u8) and a*sign(w) (i8) for the u8×i8 expected by vpdpbusd.
+    vpsignb_reg(em, Ymm(3), Ymm(1), Ymm(1));
+    vpsignb_reg(em, Ymm(2), Ymm(2), Ymm(1));
+
+    // ymm5 accumulates 8 i32 partial dot-products for this block.
+    // (Re-zeroed per block; we sum across blocks in fp32 via ymm0.)
+    vxorps_zero(em, Ymm(5));
+    vnni.emit(em, Ymm(5), Ymm(3), Ymm(2));
+
+    // i32 → fp32 (8 lanes).
+    vcvtdq2ps(em, Ymm(5), Ymm(5));
+
+    // scalar d_w * d_a → broadcast.
+    vmovd_load(em, Ymm(1), Reg::R12, Some((Reg::RAX, Scale::S1)), 0);
+    vcvtph2ps_xmm(em, Ymm(1), Ymm(1));
+    vmovd_load(em, Ymm(2), Reg::R13, Some((Reg::R10, Scale::S1)), 0);
+    vcvtph2ps_xmm(em, Ymm(2), Ymm(2));
+    vmulss_xmm(em, Ymm(1), Ymm(1), Ymm(2));
+    vbroadcastss_xmm(em, Ymm(4), Ymm(1));
+
+    // ymm0 += ymm5 * ymm4
+    vfmadd231ps_reg(em, Ymm(0), Ymm(5), Ymm(4));
 
     inc_r(em, Reg::R11);
     let jmp_kb = jmp_rel32_placeholder(em);

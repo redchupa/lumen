@@ -635,6 +635,67 @@ pub fn vpcmpeqd_reg(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
     em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
 }
 
+/// `vpdpbusd ymm_acc, ymm_a, ymm_b` (AVX-512 VNNI / AVX-512 VL — EVEX form).
+/// Same semantics as the VEX form below, but uses the 4-byte EVEX prefix
+/// instead of VEX. AVX-512 CPUs (Skylake-X / Sapphire Rapids / Zen 4) accept
+/// this form even though they don't always set the `avxvnni` CPUID bit.
+///
+/// Encoding: EVEX.NDS.256.66.0F38.W0 50 /r
+///   byte 0 = 0x62 (EVEX prefix marker)
+///   byte 1 = R̄ X̄ B̄ R̄' 0 0 mmm    (R/X/B/R' inverted; mmm=010 for 0F38)
+///   byte 2 = W vvvv 1 pp            (W=0; vvvv inverted; pp=01 for 66)
+///   byte 3 = z L'L b V̄' aaa         (z=0; L'L=01 for 256-bit; V̄'=1; no mask)
+///   byte 4 = opcode (0x50)
+///   byte 5 = ModR/M
+///
+/// Only supports ymm0..ymm15 (the bits for ymm16-31 stay zero — sufficient
+/// for our kernels which keep to caller-saved ymm0..ymm5).
+pub fn vpdpbusd_evex_reg(em: &mut Emitter, acc: Ymm, a: Ymm, b: Ymm) {
+    em.u8(0x62);
+    // P0: R̄(acc>>3 inverted) X̄(=1, no index) B̄(b>>3 inverted) R̄'(=1, acc<16) 00 mmm(0F38=010)
+    let r_bar = ((!acc.high1()) & 1) << 7;
+    let x_bar = 1 << 6;
+    let b_bar = ((!b.high1()) & 1) << 5;
+    let r_prime_bar = 1 << 4;
+    let p0 = r_bar | x_bar | b_bar | r_prime_bar | 0b010;
+    em.u8(p0);
+    // P1: W(=0) vvvv(a inverted, 4-bit) 1 pp(=01, 66)
+    let vvvv_inv = ((!a.0) & 0b1111) << 3;
+    let p1 = vvvv_inv | (1 << 2) | 0b01;
+    em.u8(p1);
+    // P2: z(=0) L'L(=01, 256-bit) b(=0) V̄'(=1, a<16) aaa(=0, no mask)
+    let p2 = (0b01 << 5) | (1 << 3);
+    em.u8(p2);
+    // Opcode + ModR/M
+    em.u8(0x50);
+    em.u8(0b11_000_000 | (acc.low3() << 3) | b.low3());
+}
+
+/// `vpdpbusd ymm_acc, ymm_a, ymm_b` (AVX-VNNI VEX form) — fused dot-product:
+///   acc_i32[i] += sum_{j=0..3}( a_u8[4i+j] * b_i8[4i+j] )
+///
+/// Replaces the `vpmaddubsw + vpmaddwd` chain (10-cycle latency) with a
+/// single ~5-cycle op when AVX-VNNI is available. CPUs that report
+/// `avxvnni` (Intel Tiger Lake / Alder Lake+) accept this VEX form; AVX-512
+/// VNNI CPUs (Zen 4 / Sapphire Rapids) need the EVEX-encoded form instead.
+///
+/// Encoding: VEX.NDS.256.66.0F38.W0 50 /r
+pub fn vpdpbusd_vex_reg(em: &mut Emitter, acc: Ymm, a: Ymm, b: Ymm) {
+    emit_vex(
+        em,
+        acc.high1(),
+        0,
+        b.high1(),
+        OpcodeMap::M0F38,
+        0,
+        a.0,
+        1,
+        Prefix::P66,
+    );
+    em.u8(0x50);
+    em.u8(0b11_000_000 | (acc.low3() << 3) | b.low3());
+}
+
 /// `vpsrlw ymm_dst, ymm_src, imm8` — logical shift right each i16 lane by imm
 /// bits. Used together with `vpcmpeqd self,self,self` to forge the 16-lane
 /// `1` constant: all-ones >> 15 = 0x0001 per i16 lane.
@@ -889,5 +950,21 @@ mod tests {
         assert!(bytes[0] == 0xC5 || bytes[0] == 0xC4);
         assert!(bytes.contains(&0x71));
         assert_eq!(*bytes.last().unwrap(), 15);
+    }
+
+    #[test]
+    fn encodes_vpdpbusd_vex_reg() {
+        // `vpdpbusd ymm0, ymm0, ymm0` — 66.0F38 map, opcode 50, 3-byte VEX.
+        // Expected exact: C4 E2 7D 50 C0
+        let bytes = enc(|e| vpdpbusd_vex_reg(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert_eq!(bytes, vec![0xC4, 0xE2, 0x7D, 0x50, 0xC0]);
+    }
+
+    #[test]
+    fn encodes_vpdpbusd_evex_reg() {
+        // `vpdpbusd ymm0, ymm0, ymm0` EVEX-256 form.
+        // Expected exact: 62 F2 7D 28 50 C0
+        let bytes = enc(|e| vpdpbusd_evex_reg(e, Ymm(0), Ymm(0), Ymm(0)));
+        assert_eq!(bytes, vec![0x62, 0xF2, 0x7D, 0x28, 0x50, 0xC0]);
     }
 }

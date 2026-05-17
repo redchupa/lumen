@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use lumen_codegen::backend::{Backend, CodegenOpts};
-use lumen_codegen::x86_64::X86_64;
+use lumen_codegen::x86_64::{VnniForm, X86_64};
 use lumen_ir::ty::{DType, Dim, Shape, TensorType};
 use lumen_ir::{Function, IrModule, Op, Value};
 
@@ -106,12 +106,17 @@ impl MatmulJitCache {
     /// `(weights[M, K]: q8_0) @ (activations[K, 1]: q8_0) → (out[M, 1]: f32)`.
     /// Constraints: `K % 32 == 0`. Only `N == 1` (decode) is supported.
     /// Phase 7.M.
+    ///
+    /// Picks the best `vpdpbusd` form at first compile based on runtime CPU
+    /// detection (Phase 7.N): AVX-512 VNNI > AVX-VNNI > AVX2 fallback
+    /// (vpsignb + vpmaddubsw + vpmaddwd). The choice is captured per-entry,
+    /// so the same `(M, K)` pair always returns the same kernel pointer.
     pub fn get_or_compile_q8q8(&mut self, m: u32, k: u32) -> Result<Q8Q8MatmulFn, JitError> {
         let key = (m, k, 1);
         let region = match self.q8q8_entries.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(v) => {
-                let compiled = compile_q8q8_matmul(m, k)?;
+                let compiled = compile_q8q8_matmul(m, k, best_vnni_form())?;
                 v.insert(compiled)
             }
         };
@@ -120,6 +125,30 @@ impl MatmulJitCache {
         // MatMul + Return), which emits a `Q8Q8MatmulFn`-signature function.
         Ok(unsafe { region.as_fn::<Q8Q8MatmulFn>() })
     }
+}
+
+/// Pick the best `vpdpbusd` encoding for this CPU, or `None` to fall back to
+/// the AVX2 vpsignb+vpmaddubsw+vpmaddwd chain.
+///
+/// Preference order:
+///   1. AVX-512 VNNI (EVEX form) — Skylake-X, Sapphire Rapids, Zen 4. EVEX
+///      is accepted by every AVX-512 capable CPU, and the `avx512vnni` CPUID
+///      bit covers both Intel and AMD reliably.
+///   2. AVX-VNNI (VEX-256 form) — Intel Tiger Lake, Alder Lake, Raptor Lake.
+///      Smaller (5-byte) encoding but not accepted on AVX-512-only CPUs that
+///      don't also set the `avxvnni` bit.
+///   3. None — fall back to the AVX2 chain.
+fn best_vnni_form() -> Option<VnniForm> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512vnni") {
+            return Some(VnniForm::Evex256);
+        }
+        if std::is_x86_feature_detected!("avxvnni") {
+            return Some(VnniForm::Vex256);
+        }
+    }
+    None
 }
 
 impl Default for MatmulJitCache {
@@ -207,7 +236,7 @@ fn compile_q8_matmul(m: u32, k: u32, n: u32) -> Result<ExecRegion, JitError> {
 ///   v4 = MatMul v2, v3 : tensor<f32, [M, 1]>
 ///   return v4
 /// ```
-fn compile_q8q8_matmul(m: u32, k: u32) -> Result<ExecRegion, JitError> {
+fn compile_q8q8_matmul(m: u32, k: u32, vnni: Option<VnniForm>) -> Result<ExecRegion, JitError> {
     let n = 1u32;
     let w_ty = TensorType {
         dtype: DType::Q8_0,
@@ -263,8 +292,12 @@ fn compile_q8q8_matmul(m: u32, k: u32) -> Result<ExecRegion, JitError> {
 
     let ir = IrModule { functions: vec![f] };
     let backend = X86_64::host();
+    let opts = CodegenOpts {
+        vnni,
+        ..Default::default()
+    };
     let mc = backend
-        .lower(&ir, &CodegenOpts::default())
+        .lower(&ir, &opts)
         .map_err(|e| JitError::Codegen(format!("{:?}", e)))?;
     let region = ExecRegion::from_machine_code(&mc)?;
     Ok(region)

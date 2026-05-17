@@ -18,6 +18,10 @@ pub struct Capabilities {
 pub struct CodegenOpts {
     pub opt_level: u8, // 0..=3
     pub dump_asm: bool,
+    /// If set, the Q8×Q8 fused matmul kernel emits `vpdpbusd` in either VEX
+    /// (AVX-VNNI) or EVEX (AVX-512 VNNI) form instead of the
+    /// `vpsignb+vpmaddubsw+vpmaddwd` chain. Phase 7.N.
+    pub vnni: Option<crate::x86_64::VnniForm>,
 }
 
 /// A buffer of native machine code (or PTX, for CUDA backend).

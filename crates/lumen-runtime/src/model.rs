@@ -15,7 +15,7 @@
 
 use crate::kvcache::LayerKvCache;
 use crate::ops::{mul_in_place, rms_norm, rope_in_place, silu_in_place, softmax_rows};
-use crate::quant::{dequantize_q8_0, BlockQ8_0, QK};
+use crate::quant::{dequantize_q8_0, quantize_q8_0, BlockQ8_0, QK};
 use lumen_jit::MatmulJitCache;
 use std::borrow::Cow;
 
@@ -224,6 +224,143 @@ fn weight_matmul_jit_storage(
 /// rayon, while gate_up (M=4864, K_blocks=28 = 136K) and down (M=896,
 /// K_blocks=152 = 136K) sped up ~2×.
 const MULTI_THREAD_WORK_THRESHOLD: usize = 100_000;
+
+/// Quantize an `[f32; N]` activation buffer into Q8_0 blocks. `N` must be
+/// a multiple of 32. Used by the decode forward to feed the Q8×Q8 fused
+/// kernel (Phase 7.M groundwork; activated in Phase 7.N when the host CPU
+/// supports vpdpbusd).
+fn quantize_activation_q8(x: &[f32]) -> Vec<BlockQ8_0> {
+    debug_assert!(
+        x.len() % QK == 0,
+        "activation length must be a multiple of 32"
+    );
+    let mut blocks = vec![
+        BlockQ8_0 {
+            d: 0,
+            qs: [0i8; 32]
+        };
+        x.len() / QK
+    ];
+    quantize_q8_0(x, &mut blocks);
+    blocks
+}
+
+/// True when the current CPU has either AVX-VNNI (VEX) or AVX-512 VNNI
+/// (EVEX) — i.e. `vpdpbusd` will be emitted by the Q8×Q8 kernel and the
+/// activation-quantization pipeline is worth the cost.
+fn has_vnni() -> bool {
+    // Phase 7.N: vpdpbusd via EVEX-256 (Zen 4 / Sapphire Rapids) was measured
+    // ~3.6% SLOWER than the AVX2 Q8×F32 4-acc kernel on Zen 4 — the single-
+    // fp32-accumulator design of the current VNNI kernel can't beat 4-acc
+    // FMA pipelining. The infrastructure (encoders, IR pattern, MatmulJitCache
+    // dispatch, model.rs integration) is kept as the building block for the
+    // forthcoming multi-acc VNNI kernel and the Intel AVX-VNNI-only path
+    // (Tiger Lake / Alder Lake) where there's no AVX-512 fp32 alternative.
+    // For now, default-off across all CPUs.
+    false
+}
+
+/// Activation-quantized variant of [`weight_matmul_jit_storage`]. Caller
+/// supplies the activation pre-quantized to Q8_0 blocks (typically reused
+/// across the Q/K/V projections from one RMSNorm output). For F32 weights
+/// (test-only) we dequantize the activation back and fall through to the
+/// fp32 path.
+fn weight_matmul_jit_storage_q8act(
+    a_blocks: &[BlockQ8_0],
+    w: &WeightStorage,
+    d_in: usize,
+    d_out: usize,
+    jit: &mut MatmulJitCache,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; d_out];
+    match w {
+        WeightStorage::F32(buf) => {
+            let mut a_f32 = vec![0.0f32; d_in];
+            dequantize_q8_0(a_blocks, &mut a_f32);
+            let f = jit
+                .get_or_compile(1, d_in as u32, d_out as u32)
+                .expect("f32 matmul JIT compile");
+            // SAFETY: kernel compiled for (1, d_in, d_out); buffers sized.
+            unsafe {
+                f(a_f32.as_ptr(), buf.as_ptr(), out.as_mut_ptr());
+            }
+        }
+        WeightStorage::Q8(weight_blocks) => {
+            q8q8_matmul_dispatch(a_blocks, weight_blocks, d_in, d_out, jit, &mut out);
+        }
+    }
+    out
+}
+
+/// Dispatch a Q8×Q8 N=1 matmul, possibly across multiple pool worker threads.
+/// Same M-direction chunking + work-based threshold as `q8_matmul_dispatch`.
+fn q8q8_matmul_dispatch(
+    a_blocks: &[BlockQ8_0],
+    weights: &[BlockQ8_0],
+    d_in: usize,
+    d_out: usize,
+    jit: &mut MatmulJitCache,
+    out: &mut [f32],
+) {
+    let pool = crate::threadpool::global();
+    let nthreads = pool.n_workers();
+    let work_units = d_out * (d_in / 32);
+
+    if work_units < MULTI_THREAD_WORK_THRESHOLD || nthreads <= 1 {
+        let f = jit
+            .get_or_compile_q8q8(d_out as u32, d_in as u32)
+            .expect("q8q8 matmul JIT compile");
+        // SAFETY: kernel compiled for exactly (d_out, d_in, 1); buffers sized.
+        unsafe {
+            f(
+                weights.as_ptr() as *const u8,
+                a_blocks.as_ptr() as *const u8,
+                out.as_mut_ptr(),
+            );
+        }
+        return;
+    }
+
+    let chunk_rows = d_out.div_ceil(nthreads);
+    let n_chunks = d_out.div_ceil(chunk_rows);
+    let last_rows = d_out - (n_chunks - 1) * chunk_rows;
+
+    let f_reg = jit
+        .get_or_compile_q8q8(chunk_rows as u32, d_in as u32)
+        .expect("q8q8 matmul JIT compile (chunk)");
+    let f_last = if last_rows != chunk_rows {
+        jit.get_or_compile_q8q8(last_rows as u32, d_in as u32)
+            .expect("q8q8 matmul JIT compile (tail)")
+    } else {
+        f_reg
+    };
+
+    let k_blocks = d_in / 32;
+    let row_bytes = k_blocks * 34;
+
+    let weights_base_addr: usize = weights.as_ptr() as usize;
+    let acts_base_addr: usize = a_blocks.as_ptr() as usize;
+    let out_base_addr: usize = out.as_mut_ptr() as usize;
+
+    pool.parallel_for(n_chunks, |chunk_idx| {
+        let row_start = chunk_idx * chunk_rows;
+        let actual_rows = (d_out - row_start).min(chunk_rows);
+        let fn_ptr = if actual_rows == chunk_rows {
+            f_reg
+        } else {
+            f_last
+        };
+        // SAFETY: row_start * row_bytes is within the original weights slice;
+        // each thread writes a disjoint output row range; activations are
+        // shared read-only.
+        let w_ptr = (weights_base_addr + row_start * row_bytes) as *const u8;
+        let a_ptr = acts_base_addr as *const u8;
+        let out_ptr = (out_base_addr + row_start * std::mem::size_of::<f32>()) as *mut f32;
+        unsafe {
+            fn_ptr(w_ptr, a_ptr, out_ptr);
+        }
+    });
+}
 
 /// Dispatch a Q8 N=1 matmul, possibly across multiple rayon threads.
 ///
@@ -681,16 +818,27 @@ pub fn forward_layer_decode_jit(
         cfg.rms_norm_eps,
     );
 
-    // 2. Q/K/V projection through JIT (per-weight storage dispatch), plus
-    //    optional biases. (Phase 7.M added a Q8×Q8 fused kernel + activation
-    //    quantization pipeline behind `weight_matmul_jit_storage_q8act`; it
-    //    netted neutral on AVX2-only — down_matmul's 152-block-per-row
-    //    dependency chain regressed +26% while shorter-K matmuls improved.
-    //    Leaving the production path on the Q8×F32 4-acc kernel until
-    //    AVX-VNNI `vpdpbusd` makes the int chain actually win.)
-    let mut q = weight_matmul_jit_storage(&x_norm, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
-    let mut k = weight_matmul_jit_storage(&x_norm, &layer.wk, cfg.hidden, cfg.kv_dim(), jit);
-    let mut v = weight_matmul_jit_storage(&x_norm, &layer.wv, cfg.hidden, cfg.kv_dim(), jit);
+    // 2. Q/K/V projection through JIT. On CPUs with VNNI (AVX-VNNI or
+    //    AVX-512 VNNI), quantize x_norm once and run the three projections
+    //    through the Q8×Q8 fused kernel (vpdpbusd). Otherwise fall back to
+    //    the Q8×F32 4-acc kernel — Phase 7.M measured the AVX2-only int
+    //    chain as net-neutral, so we only switch when vpdpbusd is actually
+    //    available.
+    let (mut q, mut k, mut v) = if has_vnni() {
+        let x_norm_q8 = quantize_activation_q8(&x_norm);
+        let q =
+            weight_matmul_jit_storage_q8act(&x_norm_q8, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
+        let k =
+            weight_matmul_jit_storage_q8act(&x_norm_q8, &layer.wk, cfg.hidden, cfg.kv_dim(), jit);
+        let v =
+            weight_matmul_jit_storage_q8act(&x_norm_q8, &layer.wv, cfg.hidden, cfg.kv_dim(), jit);
+        (q, k, v)
+    } else {
+        let q = weight_matmul_jit_storage(&x_norm, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
+        let k = weight_matmul_jit_storage(&x_norm, &layer.wk, cfg.hidden, cfg.kv_dim(), jit);
+        let v = weight_matmul_jit_storage(&x_norm, &layer.wv, cfg.hidden, cfg.kv_dim(), jit);
+        (q, k, v)
+    };
     if let Some(b) = &layer.b_q {
         add_bias_broadcast(&mut q, b, cfg.q_dim());
     }
@@ -721,9 +869,13 @@ pub fn forward_layer_decode_jit(
     cache.append(&k, &v);
     let attn = attention_decode(&q, cache, cfg);
 
-    // 5. output projection (wo: ggml-native [hidden, q_dim]; F32 is transposed
-    //    in place to [q_dim, hidden], Q8 stays native).
-    let attn_out = weight_matmul_jit_storage(&attn, &layer.wo, cfg.q_dim(), cfg.hidden, jit);
+    // 5. output projection.
+    let attn_out = if has_vnni() {
+        let attn_q8 = quantize_activation_q8(&attn);
+        weight_matmul_jit_storage_q8act(&attn_q8, &layer.wo, cfg.q_dim(), cfg.hidden, jit)
+    } else {
+        weight_matmul_jit_storage(&attn, &layer.wo, cfg.q_dim(), cfg.hidden, jit)
+    };
 
     // 6. residual
     let mut resid: Vec<f32> = x_t
@@ -743,16 +895,40 @@ pub fn forward_layer_decode_jit(
     );
 
     // 8. gate/up
-    let mut gate =
-        weight_matmul_jit_storage(&ffn_in, &layer.w_gate, cfg.hidden, cfg.ffn_hidden, jit);
-    let up = weight_matmul_jit_storage(&ffn_in, &layer.w_up, cfg.hidden, cfg.ffn_hidden, jit);
+    let (mut gate, up) = if has_vnni() {
+        let ffn_in_q8 = quantize_activation_q8(&ffn_in);
+        let g = weight_matmul_jit_storage_q8act(
+            &ffn_in_q8,
+            &layer.w_gate,
+            cfg.hidden,
+            cfg.ffn_hidden,
+            jit,
+        );
+        let u = weight_matmul_jit_storage_q8act(
+            &ffn_in_q8,
+            &layer.w_up,
+            cfg.hidden,
+            cfg.ffn_hidden,
+            jit,
+        );
+        (g, u)
+    } else {
+        let g = weight_matmul_jit_storage(&ffn_in, &layer.w_gate, cfg.hidden, cfg.ffn_hidden, jit);
+        let u = weight_matmul_jit_storage(&ffn_in, &layer.w_up, cfg.hidden, cfg.ffn_hidden, jit);
+        (g, u)
+    };
 
     // 9. SiLU(gate) * up
     silu_in_place(&mut gate);
     mul_in_place(&mut gate, &up);
 
     // 10. down
-    let ffn_out = weight_matmul_jit_storage(&gate, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit);
+    let ffn_out = if has_vnni() {
+        let gate_q8 = quantize_activation_q8(&gate);
+        weight_matmul_jit_storage_q8act(&gate_q8, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit)
+    } else {
+        weight_matmul_jit_storage(&gate, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit)
+    };
 
     // 11. residual
     for (r, o) in resid.iter_mut().zip(ffn_out.iter()) {
@@ -873,11 +1049,23 @@ pub fn forward_layer_decode_jit_timed(
     );
     timer.layer_attn_rms += t.elapsed();
 
-    // 2. Q/K/V projection.
+    // 2. Q/K/V projection — same VNNI vs f32 dispatch as the production path.
     let t = Instant::now();
-    let mut q = weight_matmul_jit_storage(&x_norm, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
-    let mut k = weight_matmul_jit_storage(&x_norm, &layer.wk, cfg.hidden, cfg.kv_dim(), jit);
-    let mut v = weight_matmul_jit_storage(&x_norm, &layer.wv, cfg.hidden, cfg.kv_dim(), jit);
+    let (mut q, mut k, mut v) = if has_vnni() {
+        let x_norm_q8 = quantize_activation_q8(&x_norm);
+        let q =
+            weight_matmul_jit_storage_q8act(&x_norm_q8, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
+        let k =
+            weight_matmul_jit_storage_q8act(&x_norm_q8, &layer.wk, cfg.hidden, cfg.kv_dim(), jit);
+        let v =
+            weight_matmul_jit_storage_q8act(&x_norm_q8, &layer.wv, cfg.hidden, cfg.kv_dim(), jit);
+        (q, k, v)
+    } else {
+        let q = weight_matmul_jit_storage(&x_norm, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
+        let k = weight_matmul_jit_storage(&x_norm, &layer.wk, cfg.hidden, cfg.kv_dim(), jit);
+        let v = weight_matmul_jit_storage(&x_norm, &layer.wv, cfg.hidden, cfg.kv_dim(), jit);
+        (q, k, v)
+    };
     timer.layer_qkv_matmul += t.elapsed();
 
     let t = Instant::now();
@@ -921,7 +1109,12 @@ pub fn forward_layer_decode_jit_timed(
 
     // 5. output projection.
     let t = Instant::now();
-    let attn_out = weight_matmul_jit_storage(&attn, &layer.wo, cfg.q_dim(), cfg.hidden, jit);
+    let attn_out = if has_vnni() {
+        let attn_q8 = quantize_activation_q8(&attn);
+        weight_matmul_jit_storage_q8act(&attn_q8, &layer.wo, cfg.q_dim(), cfg.hidden, jit)
+    } else {
+        weight_matmul_jit_storage(&attn, &layer.wo, cfg.q_dim(), cfg.hidden, jit)
+    };
     timer.layer_wo_matmul += t.elapsed();
 
     // 6. residual.
@@ -947,9 +1140,28 @@ pub fn forward_layer_decode_jit_timed(
 
     // 8. gate/up.
     let t = Instant::now();
-    let mut gate =
-        weight_matmul_jit_storage(&ffn_in, &layer.w_gate, cfg.hidden, cfg.ffn_hidden, jit);
-    let up = weight_matmul_jit_storage(&ffn_in, &layer.w_up, cfg.hidden, cfg.ffn_hidden, jit);
+    let (mut gate, up) = if has_vnni() {
+        let ffn_in_q8 = quantize_activation_q8(&ffn_in);
+        let g = weight_matmul_jit_storage_q8act(
+            &ffn_in_q8,
+            &layer.w_gate,
+            cfg.hidden,
+            cfg.ffn_hidden,
+            jit,
+        );
+        let u = weight_matmul_jit_storage_q8act(
+            &ffn_in_q8,
+            &layer.w_up,
+            cfg.hidden,
+            cfg.ffn_hidden,
+            jit,
+        );
+        (g, u)
+    } else {
+        let g = weight_matmul_jit_storage(&ffn_in, &layer.w_gate, cfg.hidden, cfg.ffn_hidden, jit);
+        let u = weight_matmul_jit_storage(&ffn_in, &layer.w_up, cfg.hidden, cfg.ffn_hidden, jit);
+        (g, u)
+    };
     timer.layer_gate_up_matmul += t.elapsed();
 
     // 9. SiLU(gate) * up.
@@ -960,7 +1172,12 @@ pub fn forward_layer_decode_jit_timed(
 
     // 10. down.
     let t = Instant::now();
-    let ffn_out = weight_matmul_jit_storage(&gate, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit);
+    let ffn_out = if has_vnni() {
+        let gate_q8 = quantize_activation_q8(&gate);
+        weight_matmul_jit_storage_q8act(&gate_q8, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit)
+    } else {
+        weight_matmul_jit_storage(&gate, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit)
+    };
     timer.layer_down_matmul += t.elapsed();
 
     // 11. residual.
@@ -1092,15 +1309,25 @@ impl Model {
             self.config.hidden(),
             self.config.layer.rms_norm_eps,
         );
-        // lm_head projection through JIT (F32: [hidden, vocab] post-transpose;
-        // Q8: native [vocab, hidden]). Dispatch handles both.
-        weight_matmul_jit_storage(
-            &x_norm,
-            &self.lm_head_w,
-            self.config.hidden(),
-            self.config.vocab_size,
-            jit,
-        )
+        // lm_head projection through JIT.
+        if has_vnni() {
+            let x_norm_q8 = quantize_activation_q8(&x_norm);
+            weight_matmul_jit_storage_q8act(
+                &x_norm_q8,
+                &self.lm_head_w,
+                self.config.hidden(),
+                self.config.vocab_size,
+                jit,
+            )
+        } else {
+            weight_matmul_jit_storage(
+                &x_norm,
+                &self.lm_head_w,
+                self.config.hidden(),
+                self.config.vocab_size,
+                jit,
+            )
+        }
     }
 
     /// Profiled variant of [`Self::forward_decode_jit`] — adds each step's
@@ -1144,13 +1371,24 @@ impl Model {
         timer.final_rms += t.elapsed();
 
         let t = Instant::now();
-        let logits = weight_matmul_jit_storage(
-            &x_norm,
-            &self.lm_head_w,
-            self.config.hidden(),
-            self.config.vocab_size,
-            jit,
-        );
+        let logits = if has_vnni() {
+            let x_norm_q8 = quantize_activation_q8(&x_norm);
+            weight_matmul_jit_storage_q8act(
+                &x_norm_q8,
+                &self.lm_head_w,
+                self.config.hidden(),
+                self.config.vocab_size,
+                jit,
+            )
+        } else {
+            weight_matmul_jit_storage(
+                &x_norm,
+                &self.lm_head_w,
+                self.config.hidden(),
+                self.config.vocab_size,
+                jit,
+            )
+        };
         timer.lm_head_matmul += t.elapsed();
         logits
     }
