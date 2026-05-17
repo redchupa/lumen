@@ -3,7 +3,7 @@
 > **IR이 양자화 커널을 자동 합성하는** LLM 추론 컴파일러 + 런타임.
 > 한국어 LLM(EXAONE, HyperCLOVA-X, A.X) 추론도 1급으로 지원.
 
-[![Build](https://img.shields.io/badge/build-passing-green)](#) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#) [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](#) [![Version](https://img.shields.io/badge/version-v0.2.0-brightgreen)](#)
+[![Build](https://img.shields.io/badge/build-passing-green)](#) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#) [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](#) [![Version](https://img.shields.io/badge/version-v0.3.0-brightgreen)](#)
 
 ---
 
