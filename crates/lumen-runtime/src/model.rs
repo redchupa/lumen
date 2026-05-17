@@ -249,21 +249,33 @@ fn quantize_activation_q8(x: &[f32]) -> Vec<BlockQ8_0> {
 /// (EVEX) — i.e. `vpdpbusd` will be emitted by the Q8×Q8 kernel and the
 /// activation-quantization pipeline is worth the cost.
 fn has_vnni() -> bool {
-    // Phase 7.O measurement (Zen 4, 8 runs each, otherwise identical):
-    //   fp32 4-acc baseline (this branch returning false):  mean 62.5 tok/s
-    //   4-acc VNNI (this branch returning true, EVEX-256):  mean 60.9 tok/s
-    //                                                       ~2.7% slower
-    //
-    // Per-step profile shows the VNNI path *winning* on gate_up (-15%), qkv
-    // (-28%), wo (-14%), lm_head (-9%) but *regressing +27% on down_matmul*.
-    // down has K_blocks=152 (vs 28 for the others); even with 4 independent
-    // fp32 sub-accumulators the chain is memory-bandwidth-bound, and the
-    // activation-quantization cost eats the wins on the other matmuls.
-    //
-    // The infrastructure stays dormant until a future phase (K-direction
-    // cache blocking for down, or AVX-512 ZMM fp32 to fold 2 blocks per
-    // op) makes VNNI an actual net win.
-    false
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx512vnni") || std::is_x86_feature_detected!("avxvnni")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Phase 7.P: pick VNNI vs fp32 path *per matmul shape*.
+///
+/// Phase 7.O's measurement showed VNNI (vpdpbusd) wins on short-K matmuls
+/// (gate_up/qkv/wo/lm_head, K_blocks=28: -9% to -28%) but loses on long-K
+/// matmuls (FFN down, K_blocks=152: +27%). Diagnosis: VNNI's 14
+/// instructions per block × long inner loop saturates the CPU OoO window,
+/// while the fp32 4-acc kernel's leaner 4-instruction inner overpacks the
+/// pipeline and beats VNNI when there are many blocks to process serially.
+///
+/// Empirical threshold from the same measurement: K_blocks ≤ 64 → VNNI
+/// wins; > 64 → fp32 4-acc wins. For Qwen2.5-0.5B this routes all five
+/// short-K matmuls to VNNI and the one long-K matmul (down) to fp32.
+fn use_vnni_for_matmul(d_in: usize) -> bool {
+    if !has_vnni() {
+        return false;
+    }
+    (d_in / 32) <= 64
 }
 
 /// Activation-quantized variant of [`weight_matmul_jit_storage`]. Caller
@@ -830,7 +842,9 @@ pub fn forward_layer_decode_jit(
     //    the Q8×F32 4-acc kernel — Phase 7.M measured the AVX2-only int
     //    chain as net-neutral, so we only switch when vpdpbusd is actually
     //    available.
-    let (mut q, mut k, mut v) = if has_vnni() {
+    // Phase 7.P: per-shape VNNI vs fp32 dispatch. K = cfg.hidden here, so the
+    // same choice covers q/k/v.
+    let (mut q, mut k, mut v) = if use_vnni_for_matmul(cfg.hidden) {
         let x_norm_q8 = quantize_activation_q8(&x_norm);
         let q =
             weight_matmul_jit_storage_q8act(&x_norm_q8, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
@@ -875,8 +889,8 @@ pub fn forward_layer_decode_jit(
     cache.append(&k, &v);
     let attn = attention_decode(&q, cache, cfg);
 
-    // 5. output projection.
-    let attn_out = if has_vnni() {
+    // 5. output projection. K = cfg.q_dim here.
+    let attn_out = if use_vnni_for_matmul(cfg.q_dim()) {
         let attn_q8 = quantize_activation_q8(&attn);
         weight_matmul_jit_storage_q8act(&attn_q8, &layer.wo, cfg.q_dim(), cfg.hidden, jit)
     } else {
@@ -900,8 +914,8 @@ pub fn forward_layer_decode_jit(
         cfg.rms_norm_eps,
     );
 
-    // 8. gate/up
-    let (mut gate, up) = if has_vnni() {
+    // 8. gate/up. K = cfg.hidden.
+    let (mut gate, up) = if use_vnni_for_matmul(cfg.hidden) {
         let ffn_in_q8 = quantize_activation_q8(&ffn_in);
         let g = weight_matmul_jit_storage_q8act(
             &ffn_in_q8,
@@ -928,8 +942,8 @@ pub fn forward_layer_decode_jit(
     silu_in_place(&mut gate);
     mul_in_place(&mut gate, &up);
 
-    // 10. down
-    let ffn_out = if has_vnni() {
+    // 10. down. K = cfg.ffn_hidden (long; usually routes to fp32 4-acc).
+    let ffn_out = if use_vnni_for_matmul(cfg.ffn_hidden) {
         let gate_q8 = quantize_activation_q8(&gate);
         weight_matmul_jit_storage_q8act(&gate_q8, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit)
     } else {
@@ -1055,9 +1069,9 @@ pub fn forward_layer_decode_jit_timed(
     );
     timer.layer_attn_rms += t.elapsed();
 
-    // 2. Q/K/V projection — same VNNI vs f32 dispatch as the production path.
+    // 2. Q/K/V projection — Phase 7.P per-shape dispatch (K = cfg.hidden).
     let t = Instant::now();
-    let (mut q, mut k, mut v) = if has_vnni() {
+    let (mut q, mut k, mut v) = if use_vnni_for_matmul(cfg.hidden) {
         let x_norm_q8 = quantize_activation_q8(&x_norm);
         let q =
             weight_matmul_jit_storage_q8act(&x_norm_q8, &layer.wq, cfg.hidden, cfg.q_dim(), jit);
@@ -1113,9 +1127,9 @@ pub fn forward_layer_decode_jit_timed(
     let attn = attention_decode(&q, cache, cfg);
     timer.layer_attention += t.elapsed();
 
-    // 5. output projection.
+    // 5. output projection (K = cfg.q_dim).
     let t = Instant::now();
-    let attn_out = if has_vnni() {
+    let attn_out = if use_vnni_for_matmul(cfg.q_dim()) {
         let attn_q8 = quantize_activation_q8(&attn);
         weight_matmul_jit_storage_q8act(&attn_q8, &layer.wo, cfg.q_dim(), cfg.hidden, jit)
     } else {
@@ -1144,9 +1158,9 @@ pub fn forward_layer_decode_jit_timed(
     );
     timer.layer_ffn_rms += t.elapsed();
 
-    // 8. gate/up.
+    // 8. gate/up (K = cfg.hidden).
     let t = Instant::now();
-    let (mut gate, up) = if has_vnni() {
+    let (mut gate, up) = if use_vnni_for_matmul(cfg.hidden) {
         let ffn_in_q8 = quantize_activation_q8(&ffn_in);
         let g = weight_matmul_jit_storage_q8act(
             &ffn_in_q8,
@@ -1176,9 +1190,9 @@ pub fn forward_layer_decode_jit_timed(
     mul_in_place(&mut gate, &up);
     timer.layer_silu_mul += t.elapsed();
 
-    // 10. down.
+    // 10. down (K = cfg.ffn_hidden; long → routes to fp32 4-acc).
     let t = Instant::now();
-    let ffn_out = if has_vnni() {
+    let ffn_out = if use_vnni_for_matmul(cfg.ffn_hidden) {
         let gate_q8 = quantize_activation_q8(&gate);
         weight_matmul_jit_storage_q8act(&gate_q8, &layer.w_down, cfg.ffn_hidden, cfg.hidden, jit)
     } else {
@@ -1315,8 +1329,8 @@ impl Model {
             self.config.hidden(),
             self.config.layer.rms_norm_eps,
         );
-        // lm_head projection through JIT.
-        if has_vnni() {
+        // lm_head projection through JIT. K = hidden (short → usually VNNI).
+        if use_vnni_for_matmul(self.config.hidden()) {
             let x_norm_q8 = quantize_activation_q8(&x_norm);
             weight_matmul_jit_storage_q8act(
                 &x_norm_q8,
@@ -1377,7 +1391,7 @@ impl Model {
         timer.final_rms += t.elapsed();
 
         let t = Instant::now();
-        let logits = if has_vnni() {
+        let logits = if use_vnni_for_matmul(self.config.hidden()) {
             let x_norm_q8 = quantize_activation_q8(&x_norm);
             weight_matmul_jit_storage_q8act(
                 &x_norm_q8,
