@@ -201,19 +201,36 @@ pub fn rope_in_place(x: &mut [f32], positions: &[u32], n_heads: usize, head_dim:
     assert_eq!(x.len(), seq * n_heads * head_dim);
 
     let half = head_dim / 2;
-    let _ = seq; // shape assertion above already used it
-    for (t, &pos_u32) in positions.iter().enumerate() {
+
+    // Phase 7.I: hoist `inv_freq` and the per-(pos, i) `sin_cos` out of the
+    // per-head loop. The old code did `n_heads × half` powf + sin_cos calls
+    // per token; now it does `half` powf + `seq × half` sin_cos calls per
+    // call regardless of head count. For Qwen2 decode (n_heads=14, half=32)
+    // that's a 14× reduction in transcendental calls on Q, and 2× on K.
+    let inv_freqs: Vec<f32> = (0..half)
+        .map(|i| base.powf(-(2.0 * i as f32) / head_dim as f32))
+        .collect();
+    let mut sins = Vec::with_capacity(seq * half);
+    let mut coss = Vec::with_capacity(seq * half);
+    for &pos_u32 in positions {
         let pos = pos_u32 as f32;
+        for &ifr in &inv_freqs {
+            let (s, c) = (pos * ifr).sin_cos();
+            sins.push(s);
+            coss.push(c);
+        }
+    }
+
+    for t in 0..seq {
         for h in 0..n_heads {
             let base_idx = t * n_heads * head_dim + h * head_dim;
             for i in 0..half {
-                let inv_freq = base.powf(-(2.0 * i as f32) / head_dim as f32);
-                let theta = pos * inv_freq;
-                let (sin_t, cos_t) = theta.sin_cos();
+                let s = sins[t * half + i];
+                let c = coss[t * half + i];
                 let a = x[base_idx + i];
                 let b = x[base_idx + i + half];
-                x[base_idx + i] = a * cos_t - b * sin_t;
-                x[base_idx + i + half] = a * sin_t + b * cos_t;
+                x[base_idx + i] = a * c - b * s;
+                x[base_idx + i + half] = a * s + b * c;
             }
         }
     }
