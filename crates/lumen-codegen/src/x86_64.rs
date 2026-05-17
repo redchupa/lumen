@@ -616,10 +616,25 @@ fn emit_function_quant_matmul_q8(
         let p_w = abi.param_reg(w_param);
         let p_a = abi.param_reg(a_param);
         let p_out = abi.param_reg(f.params.len() as u32);
-        if let Some(form) = vnni {
-            emit_quant_matmul_q8q8_n1_body_vnni(em, p_w, p_a, p_out, m as i32, k as i32, abi, form);
-        } else {
-            emit_quant_matmul_q8q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+        // 3-way kernel pick:
+        //   - VNNI + K_blocks % 4 == 0 → 4-accumulator unrolled (Phase 7.O)
+        //   - VNNI only                → single-accumulator (Phase 7.N)
+        //   - no VNNI                  → AVX2 vpsignb+vpmaddubsw+vpmaddwd (Phase 7.M)
+        let k_blocks = (k / 32) as i32;
+        match vnni {
+            Some(form) if k_blocks % 4 == 0 => {
+                emit_quant_matmul_q8q8_n1_body_vnni_4acc(
+                    em, p_w, p_a, p_out, m as i32, k as i32, abi, form,
+                );
+            }
+            Some(form) => {
+                emit_quant_matmul_q8q8_n1_body_vnni(
+                    em, p_w, p_a, p_out, m as i32, k as i32, abi, form,
+                );
+            }
+            None => {
+                emit_quant_matmul_q8q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+            }
         }
         return Ok(());
     }
@@ -1271,6 +1286,164 @@ fn emit_quant_matmul_q8q8_n1_body_vnni(
 
     // ---- epilogue ----
     add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// Q8×Q8 fused matmul (N=1), VNNI multi-accumulator variant. Phase 7.O.
+///
+/// The single-accumulator Phase 7.N kernel had ymm0 alone receiving every
+/// block's `vfmadd231ps` — for K_blocks=152 (Qwen FFN-down) that's a 4-cycle
+/// latency chain × 152 iterations = ~600 cycles per row regardless of FMA
+/// throughput. This variant unrolls the kb loop by 4 and distributes the
+/// per-block contributions across four independent fp32 sub-accumulators
+/// (ymm0..ymm3), the same trick Phase 7.G applied to the fp32 matmul kernel.
+///
+/// Requires `K_blocks % 4 == 0` (dispatcher checks). For Qwen2.5-0.5B all
+/// decode matmul shapes satisfy this (K_blocks ∈ {28, 152}).
+///
+/// Register plan adds an i32-dot scratch in ymm6, which is callee-saved on
+/// Win64 — saved at `[rsp + extra]` in the prologue, restored in epilogue.
+/// Everything else still fits in ymm0..ymm5.
+#[allow(clippy::too_many_arguments)]
+fn emit_quant_matmul_q8q8_n1_body_vnni_4acc(
+    em: &mut Emitter,
+    p_w: Reg,
+    p_a: Reg,
+    p_out: Reg,
+    m: i32,
+    k: i32,
+    abi: Abi,
+    vnni: VnniForm,
+) {
+    let k_blocks = k / 32;
+    debug_assert!(k_blocks % 4 == 0, "4-acc kernel requires K_blocks % 4 == 0");
+    let row_w_bytes = k_blocks * 34;
+
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    // Reserve 32 bytes for the ymm6 save-area on top of `extra` (shadow/align).
+    sub_ri32(em, Reg::RSP, extra + 32);
+    // Save ymm6 (Win64 callee-saved; on SysV it's caller-saved but a few extra
+    // bytes of stack don't hurt). Disp = extra puts the save area above the
+    // shadow space (or align padding on SysV). RSP base requires SIB form
+    // (encoded as `[rsp*1 + rsp + disp]` since index=RSP means "no index").
+    vmovups_store(em, Ymm(6), Reg::RSP, Some((Reg::RSP, Scale::S1)), extra);
+
+    mov_rr(em, Reg::R12, p_w);
+    mov_rr(em, Reg::R13, p_a);
+    mov_rr(em, Reg::R14, p_out);
+
+    xor_rr(em, Reg::R15);
+    let i_loop = em.len();
+    cmp_ri32(em, Reg::R15, m);
+    let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // 4 fp32 row sub-accumulators.
+    vxorps_zero(em, Ymm(0));
+    vxorps_zero(em, Ymm(1));
+    vxorps_zero(em, Ymm(2));
+    vxorps_zero(em, Ymm(3));
+
+    xor_rr(em, Reg::R11); // kb_base = 0, stepping by 4
+    let kb_loop = em.len();
+    cmp_ri32(em, Reg::R11, k_blocks);
+    let jge_kb = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // Block-quad base offsets: RAX for weights, R10 for activations.
+    mov_rr(em, Reg::RAX, Reg::R15);
+    imul_rri32(em, Reg::RAX, Reg::RAX, row_w_bytes);
+    mov_rr(em, Reg::RDX, Reg::R11);
+    imul_rri32(em, Reg::RDX, Reg::RDX, 34);
+    add_rr(em, Reg::RAX, Reg::RDX);
+
+    mov_rr(em, Reg::R10, Reg::R11);
+    imul_rri32(em, Reg::R10, Reg::R10, 34);
+
+    // 4 unrolled blocks. Each goes into a different fp32 sub-accumulator,
+    // breaking the FMA dependency chain into 4 independent streams.
+    for (j, acc) in [0i32, 1, 2, 3].into_iter().enumerate() {
+        let acc = Ymm(acc as u8);
+        let block_disp = (j as i32) * 34;
+        let q8_disp = block_disp + 2; // skip 2-byte fp16 d header
+
+        // Load weight and activation i8 bytes.
+        vmovdqu_load(em, Ymm(4), Reg::R12, Some((Reg::RAX, Scale::S1)), q8_disp);
+        vmovdqu_load(em, Ymm(5), Reg::R13, Some((Reg::R10, Scale::S1)), q8_disp);
+        // vpsignb trick: ymm5 = a*sign(w); then ymm4 = |w|. Order matters — the
+        // first vpsignb still sees the original weight in ymm4.
+        vpsignb_reg(em, Ymm(5), Ymm(5), Ymm(4));
+        vpsignb_reg(em, Ymm(4), Ymm(4), Ymm(4));
+
+        // Per-block i32 dot in ymm6 (vxorps is a zero-idiom → free on modern CPUs).
+        vxorps_zero(em, Ymm(6));
+        vnni.emit(em, Ymm(6), Ymm(4), Ymm(5));
+        vcvtdq2ps(em, Ymm(6), Ymm(6));
+
+        // scale = fp16_to_fp32(d_w) * fp16_to_fp32(d_a), broadcast to ymm4.
+        vmovd_load(
+            em,
+            Ymm(4),
+            Reg::R12,
+            Some((Reg::RAX, Scale::S1)),
+            block_disp,
+        );
+        vcvtph2ps_xmm(em, Ymm(4), Ymm(4));
+        vmovd_load(
+            em,
+            Ymm(5),
+            Reg::R13,
+            Some((Reg::R10, Scale::S1)),
+            block_disp,
+        );
+        vcvtph2ps_xmm(em, Ymm(5), Ymm(5));
+        vmulss_xmm(em, Ymm(4), Ymm(4), Ymm(5));
+        vbroadcastss_xmm(em, Ymm(4), Ymm(4));
+
+        // sub-acc[j] += ymm6 * ymm4
+        vfmadd231ps_reg(em, acc, Ymm(6), Ymm(4));
+    }
+
+    // kb_base += 4
+    add_ri32(em, Reg::R11, 4);
+    let jmp_kb = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_kb, kb_loop);
+
+    let kb_done = em.len();
+    patch_rel32(em, jge_kb, kb_done);
+
+    // Combine the 4 sub-accumulators: ymm0 = (ymm0+ymm1) + (ymm2+ymm3)
+    vaddps_reg(em, Ymm(0), Ymm(0), Ymm(1));
+    vaddps_reg(em, Ymm(2), Ymm(2), Ymm(3));
+    vaddps_reg(em, Ymm(0), Ymm(0), Ymm(2));
+
+    // Horizontal reduce ymm0 (8 fp32 lanes) -> scalar in xmm0[0], store.
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vextractf128_xmm(em, Ymm(1), Ymm(0), 1);
+    vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
+    movss_store(em, Xmm(0), Reg::R14, Some((Reg::R15, Scale::S4)), 0);
+
+    inc_r(em, Reg::R15);
+    let jmp_i = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_i, i_loop);
+
+    let i_done = em.len();
+    patch_rel32(em, jge_i, i_done);
+
+    // ---- epilogue ----
+    // Restore ymm6 from save area (RSP base → SIB form, see prologue note).
+    vmovups_load(em, Ymm(6), Reg::RSP, Some((Reg::RSP, Scale::S1)), extra);
+    add_ri32(em, Reg::RSP, extra + 32);
     pop_r64(em, Reg::RBX);
     pop_r64(em, Reg::R15);
     pop_r64(em, Reg::R14);

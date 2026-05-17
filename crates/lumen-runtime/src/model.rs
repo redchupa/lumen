@@ -249,14 +249,20 @@ fn quantize_activation_q8(x: &[f32]) -> Vec<BlockQ8_0> {
 /// (EVEX) — i.e. `vpdpbusd` will be emitted by the Q8×Q8 kernel and the
 /// activation-quantization pipeline is worth the cost.
 fn has_vnni() -> bool {
-    // Phase 7.N: vpdpbusd via EVEX-256 (Zen 4 / Sapphire Rapids) was measured
-    // ~3.6% SLOWER than the AVX2 Q8×F32 4-acc kernel on Zen 4 — the single-
-    // fp32-accumulator design of the current VNNI kernel can't beat 4-acc
-    // FMA pipelining. The infrastructure (encoders, IR pattern, MatmulJitCache
-    // dispatch, model.rs integration) is kept as the building block for the
-    // forthcoming multi-acc VNNI kernel and the Intel AVX-VNNI-only path
-    // (Tiger Lake / Alder Lake) where there's no AVX-512 fp32 alternative.
-    // For now, default-off across all CPUs.
+    // Phase 7.O measurement (Zen 4, 8 runs each, otherwise identical):
+    //   fp32 4-acc baseline (this branch returning false):  mean 62.5 tok/s
+    //   4-acc VNNI (this branch returning true, EVEX-256):  mean 60.9 tok/s
+    //                                                       ~2.7% slower
+    //
+    // Per-step profile shows the VNNI path *winning* on gate_up (-15%), qkv
+    // (-28%), wo (-14%), lm_head (-9%) but *regressing +27% on down_matmul*.
+    // down has K_blocks=152 (vs 28 for the others); even with 4 independent
+    // fp32 sub-accumulators the chain is memory-bandwidth-bound, and the
+    // activation-quantization cost eats the wins on the other matmuls.
+    //
+    // The infrastructure stays dormant until a future phase (K-direction
+    // cache blocking for down, or AVX-512 ZMM fp32 to fold 2 blocks per
+    // op) makes VNNI an actual net win.
     false
 }
 
