@@ -29,6 +29,7 @@ lumen-model = { path = "crates/lumen-model", version = "0.2.0" }
 
 # External — keep minimal (see CLAUDE.md §5)
 thiserror = "1.0"
+rayon = "1.10"
 
 [profile.release]
 opt-level = 3

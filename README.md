@@ -56,17 +56,26 @@ PyTorch나 ONNX Runtime처럼 기성 그래프 컴파일러를 갖다 쓰는 것
 
 상세 계획: [PLAN.md](./PLAN.md) · 아키텍처: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) · 벤치: [BENCHMARK.md](./BENCHMARK.md)
 
-## 현재 성능 (v0.2.0, Qwen2.5-0.5B Q8_0, 1 thread)
+## 현재 성능 (main, Qwen2.5-0.5B Q8_0)
 
-| 경로 | tg32 tok/s | vs llama.cpp |
+**단일 스레드 (`-t 1` ggml):**
+
+| 경로 | tg32 tok/s | vs ggml |
 |---|---:|---:|
 | Lumen naive Rust | 2.91 | 14.2× slower |
-| Lumen JIT v0.1.0 (4×8 tile / 1×8 AVX2) | 4.43 | 9.3× slower |
-| Lumen JIT v0.1.0 + 1×N 4-acc decode (Phase 7.C) | 5.08 | 8.1× slower |
-| **Lumen JIT v0.2.0 (+ Q8-native fused matmul)** | **17.97** | **2.30× slower** |
-| llama.cpp (ggml, b9174 AVX2) | 41.32 | 1.0× |
+| Lumen JIT v0.1.0 | 4.43 | 9.3× slower |
+| Lumen JIT v0.2.0 (Q8-native) | 17.97 | 2.30× slower |
+| Lumen JIT (Q8 4-acc + SiLU AVX2 + RoPE precomp, 7.G-I) | ~31 | 1.32× slower |
+| llama.cpp 1-thread | 41.32 | 1.0× |
 
-v0.2.0이 v0.1.0 대비 **4.05× 빨라졌습니다** (4.43 → 17.97 tok/s). 격차도 9.3× → 2.30×. 자세한 해부는 [BENCHMARK.md](./BENCHMARK.md). 토큰은 naive ↔ JIT bit-identical.
+**멀티 스레드 (8 threads):**
+
+| 경로 | tg32 tok/s | vs ggml 8t |
+|---|---:|---:|
+| **Lumen JIT main (Phase 7.J — rayon Q8 matmul)** | **~56** | **1.62× slower** |
+| llama.cpp 8-thread | 90.90 | 1.0× |
+
+v0.1.0 → main: **~12.6× decode** (4.43 → 56 tok/s). 토큰은 naive ↔ JIT bit-identical. 자세한 해부는 [BENCHMARK.md](./BENCHMARK.md).
 
 ## Quick start
 

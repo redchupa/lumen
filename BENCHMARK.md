@@ -20,14 +20,32 @@ and microkernel tuning. The gap is meaningful and we own it.
 
 ## Headline numbers
 
+### Single-thread decode (`-t 1` on the ggml side)
+
 | Path | Decode (tg32) tok/s | vs llama.cpp |
 |---|---:|---:|
 | Lumen naive Rust matmul | 2.91 | 14.2× slower |
 | Lumen JIT (4×8 tile / 1×8 AVX2, 1-acc) | 4.43 | 9.3× slower |
 | Lumen JIT (+ 1×N 4-acc decode path, Phase 7.C) | 5.08 | 8.1× slower |
 | Lumen JIT (+ Q8-native fused matmul, Phase 7.D) | 17.97 | 2.30× slower |
-| **Lumen JIT (+ 4-acc Q8 N=1 kernel, Phase 7.G)** | **29.10** | **1.42× slower** |
-| llama.cpp (ggml) | 41.32 | 1.0× |
+| Lumen JIT (+ 4-acc Q8 N=1 kernel, Phase 7.G) | 29.10 | 1.42× slower |
+| Lumen JIT (+ AVX2 SiLU/mul + RoPE precompute, 7.H/7.I) | ~31 | 1.32× slower |
+| llama.cpp (ggml, 1 thread) | 41.32 | 1.0× |
+
+### Multi-thread decode (default thread count: 8 on this box)
+
+| Path | Decode (tg32) tok/s | vs ggml @ 8t |
+|---|---:|---:|
+| **Lumen JIT v0.3 (rayon, M×K_blocks ≥ 100K parallel, Phase 7.J)** | **~56** | **1.62× slower** |
+| llama.cpp (ggml, 8 threads) | 90.90 | 1.0× |
+
+Apples-to-apples sanity check: Lumen ~56 multi-thread is **1.36× faster
+than ggml's single-thread 41.32**. Single-thread Lumen (~31) is 1.32×
+slower than single-thread ggml. So our multi-thread scaling (1.74×) lags
+ggml's (2.20×). Reducing that gap is the next milestone — most likely
+from (1) better per-thread kernel work-to-overhead ratio on the smaller
+matmuls, (2) Q8-native instead of dequant-on-the-fly inside the FMA
+loop, and (3) eventually AVX-512 where available.
 
 Phase 7.G applied the same multi-accumulator trick from 7.C to the Q8
 N=1 kernel: 4 independent ymm accumulators (one per 8-element chunk of

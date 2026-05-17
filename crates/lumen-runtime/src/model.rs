@@ -187,6 +187,11 @@ fn weight_matmul_jit(
 /// For `WeightStorage::Q8`, calls into the fused Q8×F32 N=1 kernel which
 /// reads weights in their native `[d_out, d_in]` ggml layout — no transpose,
 /// no dequant pass, no extra fp32 buffer.
+///
+/// Phase 7.J: large Q8 matmuls (M ≥ MULTI_THREAD_M_THRESHOLD) are split
+/// across rayon worker threads on the M dimension. Each chunk runs the same
+/// JIT kernel on a row-slice of weights and output; activations are shared
+/// read-only across threads.
 fn weight_matmul_jit_storage(
     a: &[f32],
     w: &WeightStorage,
@@ -206,18 +211,106 @@ fn weight_matmul_jit_storage(
             }
         }
         WeightStorage::Q8(blocks) => {
-            let f = jit
-                .get_or_compile_q8(d_out as u32, d_in as u32, 1)
-                .expect("q8 matmul JIT compile");
-            // SAFETY: cache returned a kernel compiled for (d_out, d_in, 1)
-            // expecting weights as Q8_0 blocks and activations as f32. Block
-            // count is d_out * d_in / 32 = blocks.len() (asserted at load).
-            unsafe {
-                f(blocks.as_ptr() as *const u8, a.as_ptr(), out.as_mut_ptr());
-            }
+            q8_matmul_dispatch(a, blocks, d_in, d_out, jit, &mut out);
         }
     }
     out
+}
+
+/// Minimum total Q8 block work (M × K_blocks, where K_blocks = K/32) for
+/// parallelizing a matmul. Below this, the ~5µs/call rayon dispatch
+/// overhead outweighs the saved compute. Phase 7.J profiling on Qwen2.5-0.5B
+/// showed wq/wo (M=896, K_blocks=28 = 25K work units) regressed 25-30% with
+/// rayon, while gate_up (M=4864, K_blocks=28 = 136K) and down (M=896,
+/// K_blocks=152 = 136K) sped up ~2×.
+const MULTI_THREAD_WORK_THRESHOLD: usize = 100_000;
+
+/// Dispatch a Q8 N=1 matmul, possibly across multiple rayon threads.
+///
+/// Splits the M (output row) dimension into roughly equal chunks, one per
+/// worker thread. Each thread runs an independently-compiled kernel sized
+/// for its chunk's row count on a slice of `weights` and `out`. `activations`
+/// is borrowed read-only by every thread (no contention).
+fn q8_matmul_dispatch(
+    a: &[f32],
+    weights: &[crate::quant::BlockQ8_0],
+    d_in: usize,
+    d_out: usize,
+    jit: &mut MatmulJitCache,
+    out: &mut [f32],
+) {
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8);
+    let work_units = d_out * (d_in / 32);
+
+    if work_units < MULTI_THREAD_WORK_THRESHOLD || nthreads <= 1 {
+        // Serial fast path.
+        let f = jit
+            .get_or_compile_q8(d_out as u32, d_in as u32, 1)
+            .expect("q8 matmul JIT compile");
+        // SAFETY: kernel compiled for exactly (d_out, d_in, 1); buffers sized.
+        unsafe {
+            f(weights.as_ptr() as *const u8, a.as_ptr(), out.as_mut_ptr());
+        }
+        return;
+    }
+
+    // Parallel path.
+    let chunk_rows = d_out.div_ceil(nthreads);
+    let n_chunks = d_out.div_ceil(chunk_rows);
+    let last_rows = d_out - (n_chunks - 1) * chunk_rows;
+
+    // Pre-compile both kernels in the serial section (cache requires &mut).
+    let f_reg = jit
+        .get_or_compile_q8(chunk_rows as u32, d_in as u32, 1)
+        .expect("q8 matmul JIT compile (chunk)");
+    let f_last = if last_rows != chunk_rows {
+        jit.get_or_compile_q8(last_rows as u32, d_in as u32, 1)
+            .expect("q8 matmul JIT compile (tail)")
+    } else {
+        f_reg
+    };
+
+    // One Q8_0 block packs 32 K elements; one row holds k_blocks blocks of 34B each.
+    let k_blocks = d_in / 32;
+    let row_bytes = k_blocks * 34;
+
+    // SAFETY of the parallel loop:
+    // - `weights` is `&[BlockQ8_0]` so the slice is alive for the closure's borrow.
+    //   We compute a per-chunk pointer offset by `chunk_idx * chunk_rows * row_bytes`.
+    // - `a` is `&[f32]`, read-only, shared across threads — Send+Sync on `&[f32]`.
+    // - `out.par_chunks_mut` hands each closure a disjoint `&mut [f32]` slice;
+    //   no aliasing.
+    // - The function pointer is `Copy + Send + Sync` (it's `unsafe extern "C" fn`).
+    use rayon::prelude::*;
+    // Pass pointers across the thread boundary as `usize` (Send + Sync) and
+    // cast back inside each worker. Avoids needing a Send/Sync newtype around
+    // raw pointers in the closure's captured environment.
+    let weights_base_addr: usize = weights.as_ptr() as usize;
+    let acts_base_addr: usize = a.as_ptr() as usize;
+
+    out.par_chunks_mut(chunk_rows)
+        .enumerate()
+        .for_each(|(chunk_idx, out_chunk)| {
+            let actual_rows = out_chunk.len();
+            let fn_ptr = if actual_rows == chunk_rows {
+                f_reg
+            } else {
+                f_last
+            };
+            // SAFETY: pointer arithmetic stays within the original slice; each
+            // chunk reads `actual_rows * row_bytes` bytes starting at
+            // `chunk_idx * chunk_rows * row_bytes`. Caller guarantees the
+            // weights slice covers d_out * row_bytes bytes. The kernel was
+            // compiled for exactly `actual_rows`.
+            let w_ptr = (weights_base_addr + chunk_idx * chunk_rows * row_bytes) as *const u8;
+            let a_ptr = acts_base_addr as *const f32;
+            unsafe {
+                fn_ptr(w_ptr, a_ptr, out_chunk.as_mut_ptr());
+            }
+        });
 }
 
 /// Add `bias` broadcast across each row of `x` (shape `[rows, dim]`).
