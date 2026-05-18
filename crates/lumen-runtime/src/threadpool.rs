@@ -1,44 +1,69 @@
 //! Minimal scoped thread pool tuned for short-task parallel-for.
 //!
-//! Phase 7.L: replaces rayon for the decode-time Q8 matmul fan-out. rayon's
-//! work-stealing machinery is overkill (and not free) for the pattern we
-//! actually have — a small fixed number of equal-sized chunks, dispatched
-//! many times per token. This pool pre-spawns N worker threads (once, lazily)
-//! that pull from a single mpsc channel, and provides a `parallel_for`
-//! barrier-style call.
+//! Phase 8.A: redesigned around an atomic task counter. The previous design
+//! (Phase 7.L) used one mpsc channel guarded by a mutex; workers contended on
+//! `recv` for every task, and we paid one `Box<dyn FnOnce>` allocation per
+//! task. With ~3,840 dispatches per `tg32` decode that cost dominated the
+//! 1.4× gap vs llama.cpp (see Phase 7.U gap-analysis blog).
 //!
-//! Tradeoffs we accepted:
-//! - Single mpsc channel guarded by a mutex (so workers contend on `recv`).
-//!   With ≤ 8 workers and tasks that take tens of microseconds each, this
-//!   is fine. A per-worker queue with work-stealing would be faster on
-//!   ragged workloads, but we don't have those.
-//! - One `unsafe` transmute extends the user closure's lifetime to `'static`
-//!   for the `Box<dyn FnOnce>` requirement. SAFETY rests on `parallel_for`
-//!   not returning until every task has finished — enforced by the pending
-//!   counter + condvar wait.
-//! - `Drop` is not implemented for `ThreadPool` because the only instance is
-//!   the global singleton, which lives until process exit; OS reaps the
-//!   worker threads.
+//! Design:
+//! - Workers pre-spawn once and block on a condvar waiting for a generation
+//!   counter to advance.
+//! - `parallel_for` installs `(f, n_tasks)` into a shared slot, resets the
+//!   atomic counter, bumps the generation, and notifies workers.
+//! - Each worker wakes once and loops `fetch_add(next_task)` until the counter
+//!   meets `n_tasks`. No per-task mutex; no per-task allocation.
+//! - Caller blocks on a completion condvar; workers signal when the last one
+//!   finishes.
+//!
+//! Tradeoffs:
+//! - One `unsafe` cast extends the closure borrow's lifetime for the duration
+//!   of the call. SAFETY rests on the caller blocking until every worker has
+//!   acknowledged completion before returning.
+//! - `Drop` is not implemented: the only instance is the process-wide
+//!   singleton (`global()`) and the OS reaps worker threads at exit.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
+/// Type-erased pointer to a `&(dyn Fn(usize) + Send + Sync)` valid for the
+/// duration of a `parallel_for` call.
+type FnPtr = *mut ();
 
-struct WaitState {
-    pending: AtomicUsize,
-    mutex: Mutex<()>,
-    cv: Condvar,
+/// State shared between the caller and every worker. All fields are touched
+/// per `parallel_for` call; ordering documented inline.
+struct PoolState {
+    /// Erased pointer to the user closure; published with Release in
+    /// `parallel_for`, observed with Acquire in workers.
+    job_fn: AtomicPtr<()>,
+    /// Total tasks for the current job.
+    n_tasks: AtomicUsize,
+    /// Cursor workers `fetch_add` into to claim tasks.
+    next_task: AtomicUsize,
+
+    /// Bumps once per `parallel_for`. Workers compare against their local
+    /// `last_gen` to detect a new job without re-reading `job_fn`.
+    job_generation: AtomicUsize,
+    /// Workers wait on this when idle; caller notifies after publishing a job.
+    job_mutex: Mutex<()>,
+    job_cv: Condvar,
+
+    /// Incremented by each worker exactly once per job after it drains tasks.
+    finished_workers: AtomicUsize,
+    /// Caller waits on this for `finished_workers == n_workers`.
+    completion_mutex: Mutex<()>,
+    completion_cv: Condvar,
+
+    /// How many workers belong to this pool; cached here so workers can compute
+    /// "am I the last one?" without crossing the pool boundary.
+    n_workers: usize,
 }
 
-/// A fixed-size pool of worker threads that consume jobs from a shared queue.
+/// A fixed-size pool of worker threads driven by an atomic task counter.
 pub struct ThreadPool {
-    tx: Sender<Job>,
+    state: Arc<PoolState>,
     n_workers: usize,
-    // Kept alive so threads aren't reaped prematurely; we never join them
-    // ourselves (see the module note about Drop).
     #[allow(dead_code)]
     workers: Vec<JoinHandle<()>>,
 }
@@ -46,19 +71,29 @@ pub struct ThreadPool {
 impl ThreadPool {
     pub fn new(n_workers: usize) -> Self {
         assert!(n_workers >= 1, "ThreadPool needs at least 1 worker");
-        let (tx, rx) = mpsc::channel::<Job>();
-        let rx: Arc<Mutex<Receiver<Job>>> = Arc::new(Mutex::new(rx));
+        let state = Arc::new(PoolState {
+            job_fn: AtomicPtr::new(std::ptr::null_mut()),
+            n_tasks: AtomicUsize::new(0),
+            next_task: AtomicUsize::new(0),
+            job_generation: AtomicUsize::new(0),
+            job_mutex: Mutex::new(()),
+            job_cv: Condvar::new(),
+            finished_workers: AtomicUsize::new(0),
+            completion_mutex: Mutex::new(()),
+            completion_cv: Condvar::new(),
+            n_workers,
+        });
         let workers = (0..n_workers)
             .map(|idx| {
-                let rx = rx.clone();
+                let state = state.clone();
                 thread::Builder::new()
                     .name(format!("lumen-pool-{}", idx))
-                    .spawn(move || worker_loop(rx))
+                    .spawn(move || worker_loop(state))
                     .expect("spawn pool worker")
             })
             .collect();
         Self {
-            tx,
+            state,
             n_workers,
             workers,
         }
@@ -78,52 +113,91 @@ impl ThreadPool {
         if n_tasks == 0 {
             return;
         }
-        let wait = Arc::new(WaitState {
-            pending: AtomicUsize::new(n_tasks),
-            mutex: Mutex::new(()),
-            cv: Condvar::new(),
-        });
-        // SAFETY: every Box we send below holds a `&'static dyn Fn(usize)`
-        // forged from a borrow of `f` by transmute. The borrow is valid for
-        // the duration of `parallel_for`; we block on `wait.pending` reaching
-        // zero before returning, so no task outlives `f`'s real lifetime.
-        let f_borrow: &(dyn Fn(usize) + Send + Sync) = &f;
-        let f_static: &'static (dyn Fn(usize) + Send + Sync) =
-            unsafe { std::mem::transmute(f_borrow) };
 
-        for i in 0..n_tasks {
-            let wait = wait.clone();
-            self.tx
-                .send(Box::new(move || {
-                    f_static(i);
-                    if wait.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-                        let _guard = wait.mutex.lock().expect("wait mutex");
-                        wait.cv.notify_all();
-                    }
-                }))
-                .expect("pool channel closed unexpectedly");
+        // SAFETY: the pointer below is dereferenced only by workers, which
+        // we block on (`completion_cv`) before this function returns. The
+        // borrow `&f` therefore outlives every use of the raw pointer.
+        let f_ref: &(dyn Fn(usize) + Send + Sync) = &f;
+        let fat_ptr: *const (dyn Fn(usize) + Send + Sync) = f_ref;
+        let fn_box: Box<*const (dyn Fn(usize) + Send + Sync)> = Box::new(fat_ptr);
+        let fn_ptr = Box::into_raw(fn_box) as *mut ();
+
+        // Reset per-job counters and publish the job.
+        self.state.next_task.store(0, Ordering::Relaxed);
+        self.state.finished_workers.store(0, Ordering::Relaxed);
+        self.state.n_tasks.store(n_tasks, Ordering::Relaxed);
+        self.state.job_fn.store(fn_ptr, Ordering::Release);
+
+        // Bump generation and wake workers under the mutex so wakeups can't
+        // race with workers re-checking `job_generation` and going back to
+        // sleep.
+        {
+            let _g = self.state.job_mutex.lock().expect("job mutex");
+            self.state.job_generation.fetch_add(1, Ordering::Release);
+            self.state.job_cv.notify_all();
         }
 
-        // Block until every task has decremented the counter.
-        let mut guard = wait.mutex.lock().expect("wait mutex");
-        while wait.pending.load(Ordering::Acquire) > 0 {
-            guard = wait.cv.wait(guard).expect("wait condvar");
+        // Wait for every worker to acknowledge completion of this job.
+        {
+            let mut g = self.state.completion_mutex.lock().expect("completion mutex");
+            while self.state.finished_workers.load(Ordering::Acquire) < self.n_workers {
+                g = self
+                    .state
+                    .completion_cv
+                    .wait(g)
+                    .expect("completion condvar");
+            }
+        }
+
+        // Reclaim the heap box. SAFETY: every worker stopped dereferencing
+        // the pointer before bumping `finished_workers`, and we already
+        // observed `finished_workers == n_workers` above.
+        unsafe {
+            drop(Box::from_raw(
+                fn_ptr as *mut *const (dyn Fn(usize) + Send + Sync),
+            ));
         }
     }
 }
 
-fn worker_loop(rx: Arc<Mutex<Receiver<Job>>>) {
+fn worker_loop(state: Arc<PoolState>) {
+    let mut last_gen: usize = 0;
     loop {
-        // Hold the lock just long enough to claim a job; the Job itself runs
-        // outside the lock so the rest of the workers can claim theirs.
-        let job = {
-            let guard = rx.lock().expect("worker rx mutex");
-            guard.recv()
-        };
-        match job {
-            Ok(job) => job(),
-            // Sender dropped — pool tearing down.
-            Err(_) => break,
+        // Wait for a new job. The generation counter bumps once per
+        // parallel_for; comparing against `last_gen` avoids missed wakeups.
+        {
+            let mut guard = state.job_mutex.lock().expect("worker job mutex");
+            while state.job_generation.load(Ordering::Acquire) == last_gen {
+                guard = state.job_cv.wait(guard).expect("worker job condvar");
+            }
+            last_gen = state.job_generation.load(Ordering::Acquire);
+        }
+
+        // Read job. The Release store in parallel_for happens-before this
+        // Acquire load via the condvar handoff, so the pointer is valid.
+        let fn_ptr = state.job_fn.load(Ordering::Acquire) as *const *const (dyn Fn(usize) + Send + Sync);
+        let n_tasks = state.n_tasks.load(Ordering::Relaxed);
+        // SAFETY: see parallel_for; the box stays alive until every worker
+        // has bumped `finished_workers`.
+        let f: &(dyn Fn(usize) + Send + Sync) = unsafe { &**fn_ptr };
+
+        // Drain tasks from the shared counter. fetch_add gives each worker
+        // a contiguous-but-interleaved run; for our typical 8-worker /
+        // 8-task pattern this hands every worker exactly one task with no
+        // contention beyond the single atomic increment.
+        loop {
+            let i = state.next_task.fetch_add(1, Ordering::Relaxed);
+            if i >= n_tasks {
+                break;
+            }
+            f(i);
+        }
+
+        // Signal completion. The last worker wakes the caller.
+        let prev = state.finished_workers.fetch_add(1, Ordering::AcqRel);
+        if prev + 1 == state.n_workers {
+            let _g = state.completion_mutex.lock().expect("worker completion mutex");
+            state.completion_cv.notify_one();
         }
     }
 }
@@ -132,12 +206,20 @@ static GLOBAL_POOL: OnceLock<ThreadPool> = OnceLock::new();
 
 /// Lazily-initialized process-wide pool. Worker count is the system's
 /// available parallelism, capped at 8 to bound L3 contention on bigger boxes.
+///
+/// Override via `LUMEN_THREADS=N` env var (Phase 7.U: scaling experiments).
 pub fn global() -> &'static ThreadPool {
     GLOBAL_POOL.get_or_init(|| {
-        let n = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8);
+        let n = std::env::var("LUMEN_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(8)
+            });
         ThreadPool::new(n)
     })
 }
