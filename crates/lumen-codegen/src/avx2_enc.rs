@@ -1103,6 +1103,68 @@ pub fn vpsrlw_imm8(em: &mut Emitter, dst: Ymm, src: Ymm, imm: u8) {
     em.u8(imm);
 }
 
+// ---- Phase 8.C: software prefetch ----------------------------------------
+//
+// Legacy SSE prefetch hints (0F 18). The opcode-extension field (reg) of the
+// ModR/M byte selects the hint level:
+//   /0 = PREFETCHNTA (non-temporal — bring into a single way of L1 then
+//        evict; minimal cache pollution)
+//   /1 = PREFETCHT0  (all caches L1/L2/L3)
+//   /2 = PREFETCHT1  (L2/L3)
+//   /3 = PREFETCHT2  (L3)
+//
+// REX.B is needed if the base reg is R8..R15; REX.X if the (optional) index
+// reg is R8..R15. Operand-size override (W) is irrelevant — these are address-
+// only ops.
+//
+// Used by matmul codegen to hide DRAM-load latency on the weight stream
+// (Phase 7.U found we sit at 55% of DDR5-5200 peak vs ggml's 74%).
+
+#[inline]
+fn emit_prefetch(
+    em: &mut Emitter,
+    hint: u8, // 0=NTA, 1=T0, 2=T1, 3=T2
+    base: Reg,
+    index: Option<(Reg, Scale)>,
+    disp: i32,
+) {
+    let base_h = base.high1();
+    let x_h = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    if base_h != 0 || x_h != 0 {
+        // REX prefix: 0100 W R X B. W=0, R=0 (reg field is opcode ext).
+        em.u8(0x40 | (x_h << 1) | base_h);
+    }
+    em.u8(0x0F);
+    em.u8(0x18);
+    emit_modrm_sib_disp32(em, hint & 0b111, base, index, disp);
+}
+
+/// `prefetcht0 [base + index*scale + disp32]` — prefetch into all caches.
+///
+/// Encoding: 0F 18 /1
+#[allow(dead_code)] // Phase 8.C infra; default-off after measurement regression
+pub fn prefetcht0(em: &mut Emitter, base: Reg, index: Option<(Reg, Scale)>, disp: i32) {
+    emit_prefetch(em, 1, base, index, disp);
+}
+
+/// `prefetcht1 [base + index*scale + disp32]` — prefetch into L2/L3.
+///
+/// Encoding: 0F 18 /2
+#[allow(dead_code)]
+pub fn prefetcht1(em: &mut Emitter, base: Reg, index: Option<(Reg, Scale)>, disp: i32) {
+    emit_prefetch(em, 2, base, index, disp);
+}
+
+/// `prefetchnta [base + index*scale + disp32]` — non-temporal prefetch
+/// (single-way L1, no L2/L3 pollution). Best fit for streamed weight reads
+/// that aren't re-used inside the same matmul call.
+///
+/// Encoding: 0F 18 /0
+#[allow(dead_code)] // Phase 8.C infra; default-off after measurement regression
+pub fn prefetchnta(em: &mut Emitter, base: Reg, index: Option<(Reg, Scale)>, disp: i32) {
+    emit_prefetch(em, 0, base, index, disp);
+}
+
 // ---- shared ModR/M+SIB+disp32 emission ----------------------------------
 
 fn emit_modrm_sib_disp32(
@@ -1185,6 +1247,40 @@ mod tests {
             enc(|e| vfmadd231ps_mem(e, Ymm(2), Ymm(0), Reg::R13, Some((Reg::RAX, Scale::S4)), 0));
         assert_eq!(bytes[0], 0xC4); // 3-byte VEX
         assert!(bytes.contains(&0xB8));
+    }
+
+    /// `prefetcht0 [rdx + 0]` — no REX (low base, no index).
+    /// Expected: 0F 18 8A 00 00 00 00
+    ///   0F 18 : prefetch opcode
+    ///   8A    : ModRM mod=10 (disp32), reg=001 (T0 hint), rm=010 (RDX)
+    ///   00..  : disp32 = 0
+    #[test]
+    fn encodes_prefetcht0_rdx() {
+        assert_eq!(
+            enc(|e| prefetcht0(e, Reg::RDX, None, 0)),
+            vec![0x0F, 0x18, 0x8A, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// `prefetchnta [rcx + 0x100]` — hint=0 means NTA.
+    /// Expected: 0F 18 81 00 01 00 00
+    ///   ModRM: mod=10, reg=000 (NTA), rm=001 (RCX)
+    #[test]
+    fn encodes_prefetchnta_rcx_disp() {
+        assert_eq!(
+            enc(|e| prefetchnta(e, Reg::RCX, None, 0x100)),
+            vec![0x0F, 0x18, 0x81, 0x00, 0x01, 0x00, 0x00]
+        );
+    }
+
+    /// `prefetcht0 [r12 + rax*1 + 0]` — REX.B (r12 is high reg) + SIB form
+    /// (r12.low3==100 forces SIB just like RSP).
+    /// Expected first bytes: 41 0F 18 ...
+    #[test]
+    fn encodes_prefetcht0_r12_high_reg() {
+        let bytes = enc(|e| prefetcht0(e, Reg::R12, Some((Reg::RAX, Scale::S1)), 0));
+        assert_eq!(bytes[0], 0x41); // REX.B
+        assert_eq!(&bytes[1..3], &[0x0F, 0x18]);
     }
 
     #[test]
