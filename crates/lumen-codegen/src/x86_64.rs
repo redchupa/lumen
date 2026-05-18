@@ -15,11 +15,11 @@
 use crate::avx2_enc::{
     vaddps_reg, vaddps_zmm_reg, vaddss_xmm, vbroadcastss, vbroadcastss_xmm, vbroadcastss_zmm_xmm,
     vcvtdq2ps, vcvtdq2ps_zmm, vcvtph2ps_xmm, vcvtsi2ss_xmm_r32, vdivss_xmm, vextractf128_xmm,
-    vextractf32x8_zmm, vfmadd231ps_mem, vfmadd231ps_reg, vfmadd231ps_zmm_mem, vhaddps_ymm,
-    vmovd_load, vmovdqu_load, vmovups_load, vmovups_store, vmulps_reg, vmulps_zmm_reg, vmulss_xmm,
-    vpcmpeqd_reg, vpdpbusd_evex_reg, vpdpbusd_vex_reg, vpmaddubsw_reg, vpmaddwd_reg,
-    vpmovsxbd_load, vpmovsxbd_zmm_load, vpsignb_reg, vpsrlw_imm8, vsqrtss_xmm, vxorps_zero,
-    vxorps_zmm_zero, Ymm, Zmm,
+    vextractf32x8_zmm, vfmadd231ps_mem, vfmadd231ps_reg, vfmadd231ps_zmm_mem, vfmadd231ps_zmm_reg,
+    vhaddps_ymm, vmovd_load, vmovdqu_load, vmovups_load, vmovups_store, vmulps_reg, vmulps_zmm_reg,
+    vmulss_xmm, vpcmpeqd_reg, vpdpbusd_evex_reg, vpdpbusd_vex_reg, vpmaddubsw_reg, vpmaddwd_reg,
+    vpmaddwd_zmm_reg, vpmovsxbd_load, vpmovsxbd_zmm_load, vpmovsxbw_zmm_load, vpsignb_reg,
+    vpsrlw_imm8, vsqrtss_xmm, vxorps_zero, vxorps_zmm_zero, Ymm, Zmm,
 };
 // Note: vpaddd_reg is exported but not used in any kernel yet (it was added
 // alongside the other AVX2 integer ops in Phase 7.M for future kernels).
@@ -620,24 +620,32 @@ fn emit_function_quant_matmul_q8(
         let p_w = abi.param_reg(w_param);
         let p_a = abi.param_reg(a_param);
         let p_out = abi.param_reg(f.params.len() as u32);
-        // 3-way kernel pick:
-        //   - VNNI + K_blocks % 4 == 0 → 4-accumulator unrolled (Phase 7.O)
-        //   - VNNI only                → single-accumulator (Phase 7.N)
-        //   - no VNNI                  → AVX2 vpsignb+vpmaddubsw+vpmaddwd (Phase 7.M)
+        // 4-way kernel pick (in order of preference on capable hosts):
+        //   - use_avx512 + K_blocks % 4 == 0 → ZMM 4-acc (Phase 7.T;
+        //     uses vpmovsxbw + vpmaddwd, sidesteps vpsignb-not-in-EVEX)
+        //   - VNNI + K_blocks % 4 == 0       → YMM 4-acc (Phase 7.O)
+        //   - VNNI only                       → YMM single-accumulator (7.N)
+        //   - no VNNI                         → AVX2 vpsignb+vpmaddubsw+vpmaddwd (7.M)
         let k_blocks = (k / 32) as i32;
-        match vnni {
-            Some(form) if k_blocks % 4 == 0 => {
-                emit_quant_matmul_q8q8_n1_body_vnni_4acc(
-                    em, p_w, p_a, p_out, m as i32, k as i32, abi, form,
-                );
-            }
-            Some(form) => {
-                emit_quant_matmul_q8q8_n1_body_vnni(
-                    em, p_w, p_a, p_out, m as i32, k as i32, abi, form,
-                );
-            }
-            None => {
-                emit_quant_matmul_q8q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+        if use_avx512 && k_blocks % 4 == 0 {
+            emit_quant_matmul_q8q8_n1_body_vnni_4acc_zmm(
+                em, p_w, p_a, p_out, m as i32, k as i32, abi,
+            );
+        } else {
+            match vnni {
+                Some(form) if k_blocks % 4 == 0 => {
+                    emit_quant_matmul_q8q8_n1_body_vnni_4acc(
+                        em, p_w, p_a, p_out, m as i32, k as i32, abi, form,
+                    );
+                }
+                Some(form) => {
+                    emit_quant_matmul_q8q8_n1_body_vnni(
+                        em, p_w, p_a, p_out, m as i32, k as i32, abi, form,
+                    );
+                }
+                None => {
+                    emit_quant_matmul_q8q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+                }
             }
         }
         return Ok(());
@@ -1593,6 +1601,172 @@ fn emit_quant_matmul_q8q8_n1_body_vnni_4acc(
 
     // ---- epilogue ----
     // Restore ymm6 from save area (RSP base → SIB form, see prologue note).
+    vmovups_load(em, Ymm(6), Reg::RSP, Some((Reg::RSP, Scale::S1)), extra);
+    add_ri32(em, Reg::RSP, extra + 32);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// AVX-512 ZMM 4-accumulator Q8×Q8 matmul, N=1. Phase 7.T.
+///
+/// Replaces VNNI's `vpsignb + vpdpbusd` chain with `vpmovsxbw_zmm +
+/// vpmaddwd_zmm`. `vpmaddwd` is symmetric in signedness (signed i16 ×
+/// signed i16 → i32), so we don't need the vpsignb trick for signed×
+/// signed Q8×Q8 — which is fortunate because vpsignb has no EVEX form
+/// and that limitation would have blocked a literal ZMM extension of
+/// the Phase 7.O VNNI 4-acc kernel.
+///
+/// Per Q8 block (32 K-elements):
+///   1. vpmovsxbw_zmm zmm4, [w + qs]   ; 32 i8 → 32 i16 weights
+///   2. vpmovsxbw_zmm zmm5, [a + qs]   ; 32 i8 → 32 i16 acts
+///   3. vpmaddwd_zmm  zmm4, zmm4, zmm5 ; 16 i32 (signed pair-sums)
+///   4. vcvtdq2ps_zmm zmm4, zmm4       ; 16 fp32 partials
+///   5. scale = fp16→fp32(d_w) × fp16→fp32(d_a)    (scalar)
+///   6. vbroadcastss_zmm zmm5, xmm_scale            ; → 16-lane scale
+///   7. vfmadd231ps_zmm_reg acc[j], zmm4, zmm5      ; sub-acc += partial*scale
+///
+/// 4 sub-accumulators (zmm0..zmm3) cover 4 consecutive blocks per super-
+/// iteration; each Q8 block lands in a different sub-acc, breaking the
+/// FMA chain into 4 independent streams (same trick as Phase 7.O on YMM
+/// VNNI). Requires `K_blocks % 4 == 0`.
+///
+/// Register plan (Win64-safe via stack-save of ymm6):
+///   zmm0..3 = 4 fp32 row sub-accumulators (16 lanes each)
+///   zmm4 = i16 weights / pair-sum / fp32 partials (sequential reuse)
+///   zmm5 = i16 acts / scale broadcast (sequential reuse)
+///   ymm6 = d_a scalar scratch (callee-saved on Win64; save/restore in
+///          prologue/epilogue, RSP base needs SIB form)
+#[allow(clippy::too_many_arguments)]
+fn emit_quant_matmul_q8q8_n1_body_vnni_4acc_zmm(
+    em: &mut Emitter,
+    p_w: Reg,
+    p_a: Reg,
+    p_out: Reg,
+    m: i32,
+    k: i32,
+    abi: Abi,
+) {
+    let k_blocks = k / 32;
+    debug_assert!(
+        k_blocks % 4 == 0,
+        "ZMM 4-acc kernel requires K_blocks % 4 == 0"
+    );
+    let row_w_bytes = k_blocks * 34;
+
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra + 32);
+    // Save ymm6 above the shadow space (RSP base → SIB form).
+    vmovups_store(em, Ymm(6), Reg::RSP, Some((Reg::RSP, Scale::S1)), extra);
+
+    mov_rr(em, Reg::R12, p_w);
+    mov_rr(em, Reg::R13, p_a);
+    mov_rr(em, Reg::R14, p_out);
+
+    xor_rr(em, Reg::R15);
+    let i_loop = em.len();
+    cmp_ri32(em, Reg::R15, m);
+    let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // 4 fp32 row sub-accumulators zeroed.
+    vxorps_zmm_zero(em, Zmm(0));
+    vxorps_zmm_zero(em, Zmm(1));
+    vxorps_zmm_zero(em, Zmm(2));
+    vxorps_zmm_zero(em, Zmm(3));
+
+    xor_rr(em, Reg::R11); // kb_base = 0, stepping by 4
+    let kb_loop = em.len();
+    cmp_ri32(em, Reg::R11, k_blocks);
+    let jge_kb = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // Block-quad base offsets.
+    mov_rr(em, Reg::RAX, Reg::R15);
+    imul_rri32(em, Reg::RAX, Reg::RAX, row_w_bytes);
+    mov_rr(em, Reg::RDX, Reg::R11);
+    imul_rri32(em, Reg::RDX, Reg::RDX, 34);
+    add_rr(em, Reg::RAX, Reg::RDX);
+    mov_rr(em, Reg::R10, Reg::R11);
+    imul_rri32(em, Reg::R10, Reg::R10, 34);
+
+    // 4 unrolled blocks; each lands in its own sub-accumulator.
+    for (j, acc_idx) in [0i32, 1, 2, 3].into_iter().enumerate() {
+        let acc = Zmm(acc_idx as u8);
+        let block_disp = (j as i32) * 34;
+        let q8_disp = block_disp + 2;
+
+        // 1-3. Sign-extend weights + acts, then signed i16-pair multiply.
+        vpmovsxbw_zmm_load(em, Zmm(4), Reg::R12, Some((Reg::RAX, Scale::S1)), q8_disp);
+        vpmovsxbw_zmm_load(em, Zmm(5), Reg::R13, Some((Reg::R10, Scale::S1)), q8_disp);
+        vpmaddwd_zmm_reg(em, Zmm(4), Zmm(4), Zmm(5));
+        // 4. i32 → fp32. zmm5 is now free.
+        vcvtdq2ps_zmm(em, Zmm(4), Zmm(4));
+
+        // 5. Scale = fp16(d_w) * fp16(d_a). d_w into xmm5, d_a into xmm6,
+        //    multiply in xmm5.
+        vmovd_load(
+            em,
+            Ymm(5),
+            Reg::R12,
+            Some((Reg::RAX, Scale::S1)),
+            block_disp,
+        );
+        vcvtph2ps_xmm(em, Ymm(5), Ymm(5));
+        vmovd_load(
+            em,
+            Ymm(6),
+            Reg::R13,
+            Some((Reg::R10, Scale::S1)),
+            block_disp,
+        );
+        vcvtph2ps_xmm(em, Ymm(6), Ymm(6));
+        vmulss_xmm(em, Ymm(5), Ymm(5), Ymm(6));
+        // 6. Broadcast scalar scale into all 16 lanes of zmm5.
+        vbroadcastss_zmm_xmm(em, Zmm(5), Zmm(5));
+        // 7. sub_acc[j] += zmm4 (partial fp32) * zmm5 (scale).
+        vfmadd231ps_zmm_reg(em, acc, Zmm(4), Zmm(5));
+    }
+
+    add_ri32(em, Reg::R11, 4);
+    let jmp_kb = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_kb, kb_loop);
+
+    let kb_done = em.len();
+    patch_rel32(em, jge_kb, kb_done);
+
+    // Combine 4 sub-accumulators: zmm0 += zmm1 + zmm2 + zmm3 (16-wide).
+    vaddps_zmm_reg(em, Zmm(0), Zmm(0), Zmm(1));
+    vaddps_zmm_reg(em, Zmm(2), Zmm(2), Zmm(3));
+    vaddps_zmm_reg(em, Zmm(0), Zmm(0), Zmm(2));
+
+    // Horizontal reduce zmm0 (16 fp32 lanes) → scalar in xmm0[0], store.
+    //   1. Extract upper 256 of zmm0 → ymm1.
+    //   2. ymm0 += ymm1   (lower 256 of zmm0 was already in ymm0).
+    //   3. Existing YMM hsum chain.
+    vextractf32x8_zmm(em, Ymm(1), Zmm(0), 1);
+    vaddps_reg(em, Ymm(0), Ymm(0), Ymm(1));
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vextractf128_xmm(em, Ymm(1), Ymm(0), 1);
+    vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
+    movss_store(em, Xmm(0), Reg::R14, Some((Reg::R15, Scale::S4)), 0);
+
+    inc_r(em, Reg::R15);
+    let jmp_i = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_i, i_loop);
+
+    let i_done = em.len();
+    patch_rel32(em, jge_i, i_done);
+
+    // ---- epilogue ----
     vmovups_load(em, Ymm(6), Reg::RSP, Some((Reg::RSP, Scale::S1)), extra);
     add_ri32(em, Reg::RSP, extra + 32);
     pop_r64(em, Reg::RBX);

@@ -234,17 +234,35 @@ fn compile_q8_matmul(m: u32, k: u32, n: u32) -> Result<ExecRegion, JitError> {
     Ok(region)
 }
 
-/// True when the host CPU can execute the AVX-512 ZMM Q8×F32 kernel.
-/// Needs `avx512f` (zmm fp32 ops) and `avx512bw` (`vpmovsxbd zmm, m128`).
+/// True when the host CPU can execute the AVX-512 ZMM Q8 kernels AND those
+/// kernels are actually expected to win on this microarchitecture.
+///
+/// Both ZMM kernels (Q8×F32 in Phase 7.S, Q8×Q8 in Phase 7.T) were measured
+/// net-slower than their YMM counterparts on AMD Zen 4 (~3-5% regression
+/// across 8 tg32 runs each). Diagnosis: Zen 4 implements AVX-512 as a
+/// "double-pumped" 256-bit datapath internally, so 512-bit ops don't deliver
+/// the lane-width win we'd expect — they execute as two 256-bit ops behind
+/// the scenes, while paying full EVEX-prefix overhead and a longer
+/// dependency chain (vpmovsxbw + vpmaddwd instead of one vpdpbusd; or two
+/// vpmovsxbd + vfmadd231ps_zmm instead of four parallel YMM FMAs).
+///
+/// True native-512-bit AVX-512 silicon (Intel Sapphire Rapids / Emerald
+/// Rapids / Granite Rapids, AMD Zen 5+) should flip this trade-off. Until
+/// we have measurement data on such a host, default-off everywhere. The
+/// kernels stay in tree and the unit tests exercise them (the Q8 / Q8×Q8
+/// unit tests run with use_avx512=true since they directly request that
+/// code path), but production callers don't enable it.
 fn host_supports_avx512_q8_kernel() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+        // Hardware capability check, kept so the function still represents
+        // "can the host execute this code", not the broader policy
+        // question of whether it's faster. The return below ignores this
+        // and forces false until we have positive measurement data.
+        let _has_avx512 =
+            std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw");
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
+    false
 }
 
 /// Build the IR for a Q8×Q8 fused matmul (N=1 decode) and JIT-compile it.
@@ -313,8 +331,13 @@ fn compile_q8q8_matmul(m: u32, k: u32, vnni: Option<VnniForm>) -> Result<ExecReg
 
     let ir = IrModule { functions: vec![f] };
     let backend = X86_64::host();
+    // Phase 7.T: enable the ZMM 4-acc Q8×Q8 kernel when the host has
+    // AVX-512F + AVX-512BW. The codegen picks ZMM only when both flags
+    // are set AND K_blocks % 4 == 0; otherwise it falls back through
+    // the VNNI / AVX2 chain like before.
     let opts = CodegenOpts {
         vnni,
+        use_avx512: host_supports_avx512_q8_kernel(),
         ..Default::default()
     };
     let mc = backend
@@ -547,6 +570,145 @@ mod tests {
         }
         // Cache should hold one Q8 entry per distinct shape.
         assert_eq!(cache.q8_len(), 7);
+    }
+
+    /// Phase 7.T: directly verify the AVX-512 ZMM Q8×Q8 kernel produces
+    /// correct output. The cache's production `get_or_compile_q8q8` skips
+    /// this path on Zen 4 (Phase 7.T measurement showed regression), but
+    /// the kernel itself must stay correct for future microarchitectures
+    /// where it would win. Builds the same IR pattern as `compile_q8q8_matmul`
+    /// but forces `use_avx512 = true` regardless of host policy.
+    #[test]
+    fn q8q8_n1_avx512_zmm_kernel_matches_dequant_then_naive() {
+        use lumen_codegen::backend::{Backend, CodegenOpts};
+        use lumen_codegen::x86_64::X86_64;
+        use lumen_ir::ty::{DType, Dim, Shape, TensorType};
+        use lumen_ir::{Function, IrModule, Op, Value};
+        use lumen_runtime::quant::{dequantize_q8_0, quantize_q8_0, BlockQ8_0};
+
+        // Skip when the host can't run the EVEX-512 instructions.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !(std::is_x86_feature_detected!("avx512f")
+                && std::is_x86_feature_detected!("avx512bw"))
+            {
+                eprintln!("skip: host lacks avx512f+avx512bw");
+                return;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            return;
+        }
+
+        // ZMM 4-acc requires K_blocks % 4 == 0. Pick shapes that satisfy.
+        for &(m, k) in &[(8u32, 128), (16, 128), (32, 128), (896, 896), (128, 4864)] {
+            let wts_f32: Vec<f32> = (0..(m * k) as usize)
+                .map(|i| (((i % 17) as f32) - 8.0) * 0.07)
+                .collect();
+            let acts_f32: Vec<f32> = (0..k as usize)
+                .map(|i| (((i % 13) as f32) - 6.0) * 0.04)
+                .collect();
+            let mut wts_q8 = vec![
+                BlockQ8_0 {
+                    d: 0,
+                    qs: [0i8; 32]
+                };
+                (m * k / 32) as usize
+            ];
+            quantize_q8_0(&wts_f32, &mut wts_q8);
+            let mut acts_q8 = vec![
+                BlockQ8_0 {
+                    d: 0,
+                    qs: [0i8; 32]
+                };
+                (k / 32) as usize
+            ];
+            quantize_q8_0(&acts_f32, &mut acts_q8);
+            let mut wts_dq = vec![0.0f32; (m * k) as usize];
+            dequantize_q8_0(&wts_q8, &mut wts_dq);
+            let mut acts_dq = vec![0.0f32; k as usize];
+            dequantize_q8_0(&acts_q8, &mut acts_dq);
+            let want = naive(&wts_dq, &acts_dq, m as usize, k as usize, 1);
+
+            // Build IR + lower with use_avx512 = true (regardless of host policy).
+            let w_ty = TensorType {
+                dtype: DType::Q8_0,
+                shape: Shape(vec![Dim::Static(m), Dim::Static(k)]),
+            };
+            let a_ty = TensorType {
+                dtype: DType::Q8_0,
+                shape: Shape(vec![Dim::Static(k), Dim::Static(1)]),
+            };
+            let dq_w_ty = TensorType {
+                dtype: DType::F32,
+                shape: Shape(vec![Dim::Static(m), Dim::Static(k)]),
+            };
+            let dq_a_ty = TensorType {
+                dtype: DType::F32,
+                shape: Shape(vec![Dim::Static(k), Dim::Static(1)]),
+            };
+            let c_ty = TensorType {
+                dtype: DType::F32,
+                shape: Shape(vec![Dim::Static(m), Dim::Static(1)]),
+            };
+            let mut f = Function::new("q8q8_zmm", vec![w_ty, a_ty], c_ty.clone());
+            let w = f.param_values[0];
+            let a = f.param_values[1];
+            let dw = f.push(Value {
+                op: Op::Dequantize { x: w },
+                ty: dq_w_ty,
+            });
+            let da = f.push(Value {
+                op: Op::Dequantize { x: a },
+                ty: dq_a_ty,
+            });
+            let prod = f.push(Value {
+                op: Op::MatMul { lhs: dw, rhs: da },
+                ty: c_ty,
+            });
+            let placeholder = TensorType {
+                dtype: DType::F32,
+                shape: Shape(vec![]),
+            };
+            f.push(Value {
+                op: Op::Return { value: prod },
+                ty: placeholder,
+            });
+            let ir = IrModule { functions: vec![f] };
+
+            let backend = X86_64::host();
+            let opts = CodegenOpts {
+                use_avx512: true,
+                ..Default::default()
+            };
+            let mc = backend.lower(&ir, &opts).expect("zmm compile");
+            let region = ExecRegion::from_machine_code(&mc).expect("exec region");
+            // SAFETY: kernel was just compiled for this exact (m, k, 1) Q8×Q8 shape.
+            let fn_ptr: Q8Q8MatmulFn = unsafe { region.as_fn::<Q8Q8MatmulFn>() };
+            let mut out = vec![0.0f32; m as usize];
+            unsafe {
+                fn_ptr(
+                    wts_q8.as_ptr() as *const u8,
+                    acts_q8.as_ptr() as *const u8,
+                    out.as_mut_ptr(),
+                );
+            }
+
+            let tol = 1e-3 * (k as f32).sqrt();
+            for (idx, (g, w)) in out.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() < tol,
+                    "shape ({},{},1) row {}: {} vs {} (tol {})",
+                    m,
+                    k,
+                    idx,
+                    g,
+                    w,
+                    tol
+                );
+            }
+        }
     }
 
     /// Phase 7.M: Q8 weights × Q8 activations fused matmul kernel (N=1).

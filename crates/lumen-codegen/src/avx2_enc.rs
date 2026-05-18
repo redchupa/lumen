@@ -966,6 +966,66 @@ pub fn vaddps_zmm_reg(em: &mut Emitter, dst: Zmm, src1: Zmm, src2: Zmm) {
     em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
 }
 
+/// `vpmovsxbw zmm, m256` — sign-extend 32 signed bytes from memory into
+/// 32 signed words in a ZMM. Pairs with `vpmaddwd_zmm_reg` to do
+/// signed-i8 × signed-i8 → i32 dot products without the `vpsignb` trick
+/// (vpsignb has no EVEX form, but vpmaddwd is symmetric in signedness so
+/// the trick is unnecessary).
+///
+/// Encoding: EVEX.512.66.0F38.WIG 20 /r
+pub fn vpmovsxbw_zmm_load(
+    em: &mut Emitter,
+    dst: Zmm,
+    base: Reg,
+    index: Option<(Reg, Scale)>,
+    disp: i32,
+) {
+    let x = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    emit_evex(
+        em,
+        dst.high1(),
+        x,
+        base.high1(),
+        0,
+        OpcodeMap::M0F38,
+        0,
+        0,
+        0,
+        0b10,
+        Prefix::P66,
+    );
+    em.u8(0x20);
+    emit_modrm_sib_disp32(em, dst.low3(), base, index, disp);
+}
+
+/// `vpmaddwd zmm_dst, zmm_src1, zmm_src2` — multiply 32 signed i16 pairs
+/// from src1 and src2 and horizontally sum adjacent pairs into 16 i32
+/// lanes:
+///   dst_i32[i] = src1_i16[2i]*src2_i16[2i] + src1_i16[2i+1]*src2_i16[2i+1]
+///
+/// Since vpmaddwd treats both operands as signed, this collapses one Q8
+/// block (32 signed bytes × 32 signed bytes) into 16 i32 partial sums
+/// with no vpsignb prep needed.
+///
+/// Encoding: EVEX.NDS.512.66.0F.WIG F5 /r
+pub fn vpmaddwd_zmm_reg(em: &mut Emitter, dst: Zmm, src1: Zmm, src2: Zmm) {
+    emit_evex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        0,
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        0,
+        0b10,
+        Prefix::P66,
+    );
+    em.u8(0xF5);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
 /// `vextractf32x8 ymm, zmm, imm8` — extract the low (imm=0) or high (imm=1)
 /// 256-bit half of a ZMM into a YMM. Used for horizontal-sum tails: after
 /// reducing inside a ZMM, extract the upper half to a YMM and combine with
@@ -1388,6 +1448,24 @@ mod tests {
         let bytes = enc(|e| vaddps_zmm_reg(e, Zmm(0), Zmm(0), Zmm(0)));
         assert_eq!(bytes[0], 0x62);
         assert!(bytes.contains(&0x58));
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vpmovsxbw_zmm_load() {
+        // `vpmovsxbw zmm0, [rdx]`. EVEX.512.66.0F38.WIG 20 /r
+        let bytes = enc(|e| vpmovsxbw_zmm_load(e, Zmm(0), Reg::RDX, None, 0));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x20));
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vpmaddwd_zmm_reg() {
+        // `vpmaddwd zmm0, zmm0, zmm0`. EVEX.NDS.512.66.0F.WIG F5 /r
+        let bytes = enc(|e| vpmaddwd_zmm_reg(e, Zmm(0), Zmm(0), Zmm(0)));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0xF5));
         assert_eq!(bytes[3], 0x48);
     }
 
