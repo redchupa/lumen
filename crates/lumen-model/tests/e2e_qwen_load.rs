@@ -282,6 +282,42 @@ fn qwen_bench_tg32_naive() {
     assert_eq!(new_ids.len().max(1), new_ids.len());
 }
 
+/// Phase 7.U: back-to-back tg32 runs on the same loaded model. Used to
+/// separate memory-bandwidth bound from compute bound: if run 1 is much
+/// slower than runs 2-5 then weights were cold (DRAM read) on the first
+/// pass and L3-resident afterward, i.e. matmul perf is memory bound.
+/// If all runs sit at the same number then either the weight set already
+/// fits L3 hot every run, or the kernel is compute bound.
+#[test]
+#[ignore = "loads ~640MB; ~6s in release; for profiling only"]
+fn qwen_bench_tg32_jit_repeated() {
+    if !check_qwen_present() {
+        eprintln!("skip: {} not present", QWEN_PATH);
+        return;
+    }
+    let file = GgufFile::open(QWEN_PATH).expect("open gguf");
+    let mut model = model_from_gguf(&file, "qwen2").expect("model");
+    let tok = Tokenizer::from_gguf(&file).expect("tokenizer");
+    model.transpose_for_jit();
+
+    let prompt_ids = tok.encode("안녕");
+    let max_new = 32usize;
+
+    for run in 1..=5 {
+        let t = std::time::Instant::now();
+        let new_ids = model.generate_greedy_jit(&prompt_ids, max_new);
+        let elapsed = t.elapsed();
+        let tps = max_new as f64 / elapsed.as_secs_f64();
+        eprintln!(
+            "run {}: {} tokens in {:?}  =>  {:.2} tok/s",
+            run,
+            new_ids.len(),
+            elapsed,
+            tps
+        );
+    }
+}
+
 /// Phase 7.A bench: run Qwen2.5-0.5B for 32 decode tokens via the JIT path
 /// so we can compare against llama-bench `tg32`. Single-threaded — matches
 /// our backend's thread model.
