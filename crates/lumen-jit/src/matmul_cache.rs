@@ -219,11 +219,32 @@ fn compile_q8_matmul(m: u32, k: u32, n: u32) -> Result<ExecRegion, JitError> {
     let ir = IrModule { functions: vec![f] };
 
     let backend = X86_64::host();
+    // Phase 7.S: turn on the ZMM Q8×F32 kernel when the host has AVX-512F
+    // (+ AVX-512BW for the vpmovsxbd zmm m128 load). For N=1 decode shapes
+    // this halves the per-block inner instruction count.
+    let use_avx512 = host_supports_avx512_q8_kernel();
+    let opts = CodegenOpts {
+        use_avx512,
+        ..Default::default()
+    };
     let mc = backend
-        .lower(&ir, &CodegenOpts::default())
+        .lower(&ir, &opts)
         .map_err(|e| JitError::Codegen(format!("{:?}", e)))?;
     let region = ExecRegion::from_machine_code(&mc)?;
     Ok(region)
+}
+
+/// True when the host CPU can execute the AVX-512 ZMM Q8×F32 kernel.
+/// Needs `avx512f` (zmm fp32 ops) and `avx512bw` (`vpmovsxbd zmm, m128`).
+fn host_supports_avx512_q8_kernel() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
 }
 
 /// Build the IR for a Q8×Q8 fused matmul (N=1 decode) and JIT-compile it.

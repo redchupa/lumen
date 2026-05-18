@@ -851,6 +851,148 @@ pub fn vfmadd231ps_zmm_reg(em: &mut Emitter, acc: Zmm, a: Zmm, b: Zmm) {
     em.u8(0b11_000_000 | (acc.low3() << 3) | b.low3());
 }
 
+/// `vpmovsxbd zmm, m128` — load 16 signed bytes from memory and sign-extend
+/// each to a 32-bit integer in a ZMM lane.
+///
+/// Encoding: EVEX.512.66.0F38.W0 21 /r
+pub fn vpmovsxbd_zmm_load(
+    em: &mut Emitter,
+    dst: Zmm,
+    base: Reg,
+    index: Option<(Reg, Scale)>,
+    disp: i32,
+) {
+    let x = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    emit_evex(
+        em,
+        dst.high1(),
+        x,
+        base.high1(),
+        0,
+        OpcodeMap::M0F38,
+        0,
+        0,
+        0,
+        0b10,
+        Prefix::P66,
+    );
+    em.u8(0x21);
+    emit_modrm_sib_disp32(em, dst.low3(), base, index, disp);
+}
+
+/// `vcvtdq2ps zmm_dst, zmm_src` — convert 16 i32 lanes to 16 fp32 lanes.
+///
+/// Encoding: EVEX.512.0F.W0 5B /r
+pub fn vcvtdq2ps_zmm(em: &mut Emitter, dst: Zmm, src: Zmm) {
+    emit_evex(
+        em,
+        dst.high1(),
+        0,
+        src.high1(),
+        0,
+        OpcodeMap::M0F,
+        0,
+        0,
+        0,
+        0b10,
+        Prefix::None,
+    );
+    em.u8(0x5B);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src.low3());
+}
+
+/// `vmulps zmm_dst, zmm_src1, zmm_src2` — 16-lane fp32 multiply.
+///
+/// Encoding: EVEX.NDS.512.0F.W0 59 /r
+pub fn vmulps_zmm_reg(em: &mut Emitter, dst: Zmm, src1: Zmm, src2: Zmm) {
+    emit_evex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        0,
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        0,
+        0b10,
+        Prefix::None,
+    );
+    em.u8(0x59);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vbroadcastss zmm, xmm` — broadcast a single fp32 from the low lane of
+/// an XMM (encoded as a ZMM with low3 matching the XMM index) to all 16
+/// lanes of a ZMM.
+///
+/// Encoding: EVEX.512.66.0F38.W0 18 /r (reg form)
+pub fn vbroadcastss_zmm_xmm(em: &mut Emitter, dst: Zmm, src: Zmm) {
+    emit_evex(
+        em,
+        dst.high1(),
+        0,
+        src.high1(),
+        0,
+        OpcodeMap::M0F38,
+        0,
+        0,
+        0,
+        0b10,
+        Prefix::P66,
+    );
+    em.u8(0x18);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src.low3());
+}
+
+/// `vaddps zmm_dst, zmm_src1, zmm_src2` — 16-lane fp32 add.
+///
+/// Encoding: EVEX.NDS.512.0F.W0 58 /r
+pub fn vaddps_zmm_reg(em: &mut Emitter, dst: Zmm, src1: Zmm, src2: Zmm) {
+    emit_evex(
+        em,
+        dst.high1(),
+        0,
+        src2.high1(),
+        0,
+        OpcodeMap::M0F,
+        0,
+        src1.0,
+        0,
+        0b10,
+        Prefix::None,
+    );
+    em.u8(0x58);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | src2.low3());
+}
+
+/// `vextractf32x8 ymm, zmm, imm8` — extract the low (imm=0) or high (imm=1)
+/// 256-bit half of a ZMM into a YMM. Used for horizontal-sum tails: after
+/// reducing inside a ZMM, extract the upper half to a YMM and combine with
+/// the existing ymm hsum chain.
+///
+/// Encoding: EVEX.512.66.0F3A.W0 1B /r ib
+/// Note: dst is encoded in ModR/M.rm, src is encoded in ModR/M.reg (same
+/// reg/rm flip as vextractf128).
+pub fn vextractf32x8_zmm(em: &mut Emitter, dst: Ymm, src: Zmm, imm: u8) {
+    emit_evex(
+        em,
+        src.high1(),
+        0,
+        dst.high1(),
+        0,
+        OpcodeMap::M0F3A,
+        0,
+        0,
+        0,
+        0b10,
+        Prefix::P66,
+    );
+    em.u8(0x1B);
+    em.u8(0b11_000_000 | (src.low3() << 3) | dst.low3());
+    em.u8(imm);
+}
+
 /// `vpdpbusd ymm_acc, ymm_a, ymm_b` (AVX-VNNI VEX form) — fused dot-product:
 ///   acc_i32[i] += sum_{j=0..3}( a_u8[4i+j] * b_i8[4i+j] )
 ///
@@ -1200,5 +1342,62 @@ mod tests {
         assert_eq!(bytes[0], 0x62);
         assert!(bytes.contains(&0xB8));
         assert_eq!(bytes[3], 0x48);
+    }
+
+    // ---- Phase 7.S: more ZMM encoders for the Q8×F32 ZMM kernel ---------
+
+    #[test]
+    fn encodes_vpmovsxbd_zmm_load() {
+        // `vpmovsxbd zmm0, [rdx]`. EVEX.512.66.0F38.W0 21 /r
+        let bytes = enc(|e| vpmovsxbd_zmm_load(e, Zmm(0), Reg::RDX, None, 0));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x21));
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vcvtdq2ps_zmm() {
+        // `vcvtdq2ps zmm0, zmm0`. EVEX.512.0F.W0 5B /r
+        let bytes = enc(|e| vcvtdq2ps_zmm(e, Zmm(0), Zmm(0)));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x5B));
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vmulps_zmm_reg() {
+        // `vmulps zmm0, zmm0, zmm0`. EVEX.NDS.512.0F.W0 59 /r
+        let bytes = enc(|e| vmulps_zmm_reg(e, Zmm(0), Zmm(0), Zmm(0)));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x59));
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vbroadcastss_zmm_xmm() {
+        // `vbroadcastss zmm0, xmm0`. EVEX.512.66.0F38.W0 18 /r (reg form)
+        let bytes = enc(|e| vbroadcastss_zmm_xmm(e, Zmm(0), Zmm(0)));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x18));
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vaddps_zmm_reg() {
+        // `vaddps zmm0, zmm0, zmm0`. EVEX.NDS.512.0F.W0 58 /r
+        let bytes = enc(|e| vaddps_zmm_reg(e, Zmm(0), Zmm(0), Zmm(0)));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x58));
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vextractf32x8_zmm() {
+        // `vextractf32x8 ymm0, zmm0, 1`. EVEX.512.66.0F3A.W0 1B /r ib
+        let bytes = enc(|e| vextractf32x8_zmm(e, Ymm(0), Zmm(0), 1));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x1B));
+        assert_eq!(bytes[3], 0x48);
+        assert_eq!(*bytes.last().unwrap(), 1);
     }
 }

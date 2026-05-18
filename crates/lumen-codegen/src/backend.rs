@@ -22,6 +22,10 @@ pub struct CodegenOpts {
     /// (AVX-VNNI) or EVEX (AVX-512 VNNI) form instead of the
     /// `vpsignb+vpmaddubsw+vpmaddwd` chain. Phase 7.N.
     pub vnni: Option<crate::x86_64::VnniForm>,
+    /// If true, the Q8×F32 fused matmul kernel emits ZMM-wide (16 fp32 lane)
+    /// inner loops instead of YMM-wide (8 fp32 lane). Requires AVX-512F
+    /// (and AVX-512BW for the vpmovsxbd zmm load). Phase 7.S.
+    pub use_avx512: bool,
 }
 
 /// A buffer of native machine code (or PTX, for CUDA backend).

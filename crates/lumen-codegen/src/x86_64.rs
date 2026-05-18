@@ -13,11 +13,13 @@
 //! Layout assumption: row-major, fp32, contiguous. Buffers are caller-owned.
 
 use crate::avx2_enc::{
-    vaddps_reg, vaddss_xmm, vbroadcastss, vbroadcastss_xmm, vcvtdq2ps, vcvtph2ps_xmm,
-    vcvtsi2ss_xmm_r32, vdivss_xmm, vextractf128_xmm, vfmadd231ps_mem, vfmadd231ps_reg, vhaddps_ymm,
-    vmovd_load, vmovdqu_load, vmovups_load, vmovups_store, vmulps_reg, vmulss_xmm, vpcmpeqd_reg,
-    vpdpbusd_evex_reg, vpdpbusd_vex_reg, vpmaddubsw_reg, vpmaddwd_reg, vpmovsxbd_load, vpsignb_reg,
-    vpsrlw_imm8, vsqrtss_xmm, vxorps_zero, Ymm,
+    vaddps_reg, vaddps_zmm_reg, vaddss_xmm, vbroadcastss, vbroadcastss_xmm, vbroadcastss_zmm_xmm,
+    vcvtdq2ps, vcvtdq2ps_zmm, vcvtph2ps_xmm, vcvtsi2ss_xmm_r32, vdivss_xmm, vextractf128_xmm,
+    vextractf32x8_zmm, vfmadd231ps_mem, vfmadd231ps_reg, vfmadd231ps_zmm_mem, vhaddps_ymm,
+    vmovd_load, vmovdqu_load, vmovups_load, vmovups_store, vmulps_reg, vmulps_zmm_reg, vmulss_xmm,
+    vpcmpeqd_reg, vpdpbusd_evex_reg, vpdpbusd_vex_reg, vpmaddubsw_reg, vpmaddwd_reg,
+    vpmovsxbd_load, vpmovsxbd_zmm_load, vpsignb_reg, vpsrlw_imm8, vsqrtss_xmm, vxorps_zero,
+    vxorps_zmm_zero, Ymm, Zmm,
 };
 // Note: vpaddd_reg is exported but not used in any kernel yet (it was added
 // alongside the other AVX2 integer ops in Phase 7.M for future kernels).
@@ -124,7 +126,7 @@ impl Backend for X86_64 {
         ))?;
 
         let mut em = Emitter::new();
-        emit_function(&mut em, f, self.abi, self.avx2, opts.vnni)?;
+        emit_function(&mut em, f, self.abi, self.avx2, opts.vnni, opts.use_avx512)?;
         Ok(MachineCode {
             bytes: em.buf,
             entry_offset: 0,
@@ -147,6 +149,7 @@ fn emit_function(
     abi: Abi,
     avx2: bool,
     vnni: Option<VnniForm>,
+    use_avx512: bool,
 ) -> Result<(), CodegenError> {
     let has_rms = f.values.iter().any(|v| matches!(v.op, Op::RmsNorm { .. }));
     if has_rms {
@@ -161,7 +164,7 @@ fn emit_function(
 
     // Pattern 1: dequant fused with matmul → on-the-fly quant matmul.
     if has_dequant && has_matmul {
-        return emit_function_quant_matmul_q8(em, f, abi, vnni);
+        return emit_function_quant_matmul_q8(em, f, abi, vnni, use_avx512);
     }
 
     // Pattern 2: standalone dequant.
@@ -540,6 +543,7 @@ fn emit_function_quant_matmul_q8(
     f: &Function,
     abi: Abi,
     vnni: Option<VnniForm>,
+    use_avx512: bool,
 ) -> Result<(), CodegenError> {
     // Locate the ops and verify the pattern.
     let dq_indices: Vec<usize> = f
@@ -708,7 +712,16 @@ fn emit_function_quant_matmul_q8(
     let p_out = abi.param_reg(f.params.len() as u32);
 
     if n == 1 {
-        emit_quant_matmul_q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+        // Phase 7.S: AVX-512 ZMM 2-acc variant when the host supports it.
+        // Same dataflow as the 4-acc YMM body but with 16-lane FMAs (2 sub-
+        // accumulators across the two halves of each 32-element Q8 block)
+        // — half the inner instructions for the same compute, beneficial on
+        // long-K matmuls (e.g. Qwen2 FFN-down with K_blocks=152).
+        if use_avx512 {
+            emit_quant_matmul_q8_n1_body_zmm(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+        } else {
+            emit_quant_matmul_q8_n1_body(em, p_w, p_a, p_out, m as i32, k as i32, abi);
+        }
     } else {
         emit_quant_matmul_q8_body(em, p_w, p_a, p_out, m as i32, k as i32, n as i32, abi);
     }
@@ -1004,6 +1017,144 @@ fn emit_quant_matmul_q8_n1_body(
     vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
 
     // movss [r14 + r15*4], xmm0
+    movss_store(em, Xmm(0), Reg::R14, Some((Reg::R15, Scale::S4)), 0);
+
+    inc_r(em, Reg::R15);
+    let jmp_i = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_i, i_loop);
+
+    let i_done = em.len();
+    patch_rel32(em, jge_i, i_done);
+
+    // ---- epilogue ----
+    add_ri32(em, Reg::RSP, extra);
+    pop_r64(em, Reg::RBX);
+    pop_r64(em, Reg::R15);
+    pop_r64(em, Reg::R14);
+    pop_r64(em, Reg::R13);
+    pop_r64(em, Reg::R12);
+    ret(em);
+}
+
+/// AVX-512 ZMM-wide variant of `emit_quant_matmul_q8_n1_body`. Phase 7.S.
+///
+/// Same Q8 weights × F32 activations → F32 output fused matmul (N=1
+/// decode), but the inner loop processes a Q8 block (32 K-elements) as
+/// 2 ZMM-16-lane chunks instead of 4 YMM-8-lane chunks. Two independent
+/// fp32 sub-accumulators (zmm0, zmm1) one per chunk-index keep an
+/// independent FMA chain for each half of every block.
+///
+/// Half the inner instructions per block (2 chunks vs 4) for the same
+/// compute work — and each ZMM FMA processes 16 lanes, so back-end FMA
+/// throughput stays the same. Net win comes from compute-bound shapes
+/// (Qwen2 FFN-down with K_blocks=152 hits this).
+///
+/// Register plan (Win64-safe: zmm0..zmm5 only — same physical regs as
+/// the caller-saved xmm0..xmm5):
+///   zmm0, zmm1 = fp32 row sub-accumulators
+///   zmm2 = broadcast(d_w)
+///   zmm3 = weight i32 / fp32 scratch
+///   xmm2/xmm4 = scalar scratch for the fp16→fp32 d_w (uses low lane of zmm2)
+///
+/// Requires AVX-512F + AVX-512BW (vpmovsxbd zmm m128 uses BW).
+#[allow(clippy::too_many_arguments)]
+fn emit_quant_matmul_q8_n1_body_zmm(
+    em: &mut Emitter,
+    p_w: Reg,
+    p_a: Reg,
+    p_out: Reg,
+    m: i32,
+    k: i32,
+    abi: Abi,
+) {
+    let k_blocks = k / 32;
+    let row_w_bytes = k_blocks * 34;
+
+    // ---- prologue ----
+    push_r64(em, Reg::R12);
+    push_r64(em, Reg::R13);
+    push_r64(em, Reg::R14);
+    push_r64(em, Reg::R15);
+    push_r64(em, Reg::RBX);
+    let extra = if abi == Abi::WinX64 { 40 } else { 8 };
+    sub_ri32(em, Reg::RSP, extra);
+
+    mov_rr(em, Reg::R12, p_w);
+    mov_rr(em, Reg::R13, p_a);
+    mov_rr(em, Reg::R14, p_out);
+
+    // R15 = i (output row), R11 = kb (block index), R10 = kb*32 (act idx base).
+    xor_rr(em, Reg::R15);
+    let i_loop = em.len();
+    cmp_ri32(em, Reg::R15, m);
+    let jge_i = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // Two fp32 row sub-accumulators.
+    vxorps_zmm_zero(em, Zmm(0));
+    vxorps_zmm_zero(em, Zmm(1));
+
+    xor_rr(em, Reg::R11);
+    let kb_loop = em.len();
+    cmp_ri32(em, Reg::R11, k_blocks);
+    let jge_kb = jcc_rel32_placeholder(em, Cond::GreaterOrEqual);
+
+    // RAX = i*row_w_bytes + kb*34 (weight block byte offset)
+    mov_rr(em, Reg::RAX, Reg::R15);
+    imul_rri32(em, Reg::RAX, Reg::RAX, row_w_bytes);
+    mov_rr(em, Reg::RDX, Reg::R11);
+    imul_rri32(em, Reg::RDX, Reg::RDX, 34);
+    add_rr(em, Reg::RAX, Reg::RDX);
+
+    // R10 = kb*32 (activation float index base)
+    mov_rr(em, Reg::R10, Reg::R11);
+    imul_rri32(em, Reg::R10, Reg::R10, 32);
+
+    // zmm2 = broadcast(fp16_to_fp32(d_w))
+    vmovd_load(em, Ymm(2), Reg::R12, Some((Reg::RAX, Scale::S1)), 0);
+    vcvtph2ps_xmm(em, Ymm(2), Ymm(2));
+    vbroadcastss_zmm_xmm(em, Zmm(2), Zmm(2));
+
+    // Chunk 0: K elements [0..16). zmm3 = (16 i8 → 16 i32 → 16 fp32) * d_w.
+    vpmovsxbd_zmm_load(em, Zmm(3), Reg::R12, Some((Reg::RAX, Scale::S1)), 2);
+    vcvtdq2ps_zmm(em, Zmm(3), Zmm(3));
+    vmulps_zmm_reg(em, Zmm(3), Zmm(3), Zmm(2));
+    // zmm0 += zmm3 * [r13 + r10*4 + 0] (16 fp32 activations)
+    vfmadd231ps_zmm_mem(em, Zmm(0), Zmm(3), Reg::R13, Some((Reg::R10, Scale::S4)), 0);
+
+    // Chunk 1: K elements [16..32). disp = 16 bytes (in weights) / 64 bytes (in acts).
+    vpmovsxbd_zmm_load(em, Zmm(3), Reg::R12, Some((Reg::RAX, Scale::S1)), 2 + 16);
+    vcvtdq2ps_zmm(em, Zmm(3), Zmm(3));
+    vmulps_zmm_reg(em, Zmm(3), Zmm(3), Zmm(2));
+    vfmadd231ps_zmm_mem(
+        em,
+        Zmm(1),
+        Zmm(3),
+        Reg::R13,
+        Some((Reg::R10, Scale::S4)),
+        64,
+    );
+
+    inc_r(em, Reg::R11);
+    let jmp_kb = jmp_rel32_placeholder(em);
+    patch_rel32(em, jmp_kb, kb_loop);
+
+    let kb_done = em.len();
+    patch_rel32(em, jge_kb, kb_done);
+
+    // Combine sub-accs: zmm0 += zmm1 (16 fp32 lanes).
+    vaddps_zmm_reg(em, Zmm(0), Zmm(0), Zmm(1));
+
+    // Horizontal reduce zmm0 (16 fp32 lanes) → scalar. Strategy:
+    //   1. Extract upper 8 lanes to ymm1.
+    //   2. Add to lower 8 lanes (zmm0 low half = ymm0).
+    //   3. Run the existing YMM hsum tail (vhaddps × 2 + vextractf128 + vaddss).
+    vextractf32x8_zmm(em, Ymm(1), Zmm(0), 1);
+    // ymm0 = ymm0_low + ymm1 (using the existing YMM vaddps).
+    vaddps_reg(em, Ymm(0), Ymm(0), Ymm(1));
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vhaddps_ymm(em, Ymm(0), Ymm(0), Ymm(0));
+    vextractf128_xmm(em, Ymm(1), Ymm(0), 1);
+    vaddss_xmm(em, Ymm(0), Ymm(0), Ymm(1));
     movss_store(em, Xmm(0), Reg::R14, Some((Reg::R15, Scale::S4)), 0);
 
     inc_r(em, Reg::R15);
