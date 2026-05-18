@@ -3,7 +3,7 @@
 > **IR이 양자화 커널을 자동 합성하는** LLM 추론 컴파일러 + 런타임.
 > 한국어 LLM(EXAONE, HyperCLOVA-X, A.X) 추론도 1급으로 지원.
 
-[![Build](https://img.shields.io/badge/build-passing-green)](#) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#) [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](#) [![Version](https://img.shields.io/badge/version-v0.3.0-brightgreen)](#)
+[![Build](https://img.shields.io/badge/build-passing-green)](#) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#) [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](#) [![Version](https://img.shields.io/badge/version-v0.4.0-brightgreen)](#)
 
 ---
 
@@ -56,26 +56,27 @@ PyTorch나 ONNX Runtime처럼 기성 그래프 컴파일러를 갖다 쓰는 것
 
 상세 계획: [PLAN.md](./PLAN.md) · 아키텍처: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) · 벤치: [BENCHMARK.md](./BENCHMARK.md)
 
-## 현재 성능 (main, Qwen2.5-0.5B Q8_0)
-
-**단일 스레드 (`-t 1` ggml):**
-
-| 경로 | tg32 tok/s | vs ggml |
-|---|---:|---:|
-| Lumen naive Rust | 2.91 | 14.2× slower |
-| Lumen JIT v0.1.0 | 4.43 | 9.3× slower |
-| Lumen JIT v0.2.0 (Q8-native) | 17.97 | 2.30× slower |
-| Lumen JIT (Q8 4-acc + SiLU AVX2 + RoPE precomp, 7.G-I) | ~31 | 1.32× slower |
-| llama.cpp 1-thread | 41.32 | 1.0× |
+## 현재 성능 (v0.4.0, Qwen2.5-0.5B Q8_0)
 
 **멀티 스레드 (8 threads):**
 
 | 경로 | tg32 tok/s | vs ggml 8t |
 |---|---:|---:|
-| **Lumen JIT main (Phase 7.J — rayon Q8 matmul)** | **~56** | **1.62× slower** |
+| Lumen JIT v0.3.0 (custom pool, Q8×F32 4-acc) | ~60 | 1.51× slower |
+| **Lumen JIT v0.4.0 (per-shape VNNI/fp32 dispatch)** | **~65** | **1.39× slower** |
 | llama.cpp 8-thread | 90.90 | 1.0× |
 
-v0.1.0 → main: **~12.6× decode** (4.43 → 56 tok/s). 토큰은 naive ↔ JIT bit-identical. 자세한 해부는 [BENCHMARK.md](./BENCHMARK.md).
+**단일 스레드 (`-t 1` ggml 비교용):**
+
+| 경로 | tg32 tok/s |
+|---|---:|
+| Lumen naive Rust | 2.91 |
+| Lumen JIT v0.1.0 | 4.43 |
+| Lumen JIT v0.2.0 (Q8-native) | 17.97 |
+| Lumen JIT main (7.G-P) | ~65 (multi-thread; single-thread ~32) |
+| llama.cpp 1-thread | 41.32 |
+
+v0.1.0 → v0.4.0: **14.7× decode** (4.43 → 65.3 tok/s). 멀티스레드 Lumen은 single-thread ggml(41.32)을 **1.58× 능가**. 토큰은 naive ↔ JIT bit-identical. 자세한 해부는 [BENCHMARK.md](./BENCHMARK.md).
 
 ## Quick start
 
