@@ -641,33 +641,213 @@ pub fn vpcmpeqd_reg(em: &mut Emitter, dst: Ymm, src1: Ymm, src2: Ymm) {
 /// this form even though they don't always set the `avxvnni` CPUID bit.
 ///
 /// Encoding: EVEX.NDS.256.66.0F38.W0 50 /r
-///   byte 0 = 0x62 (EVEX prefix marker)
-///   byte 1 = R̄ X̄ B̄ R̄' 0 0 mmm    (R/X/B/R' inverted; mmm=010 for 0F38)
-///   byte 2 = W vvvv 1 pp            (W=0; vvvv inverted; pp=01 for 66)
-///   byte 3 = z L'L b V̄' aaa         (z=0; L'L=01 for 256-bit; V̄'=1; no mask)
-///   byte 4 = opcode (0x50)
-///   byte 5 = ModR/M
-///
-/// Only supports ymm0..ymm15 (the bits for ymm16-31 stay zero — sufficient
-/// for our kernels which keep to caller-saved ymm0..ymm5).
 pub fn vpdpbusd_evex_reg(em: &mut Emitter, acc: Ymm, a: Ymm, b: Ymm) {
-    em.u8(0x62);
-    // P0: R̄(acc>>3 inverted) X̄(=1, no index) B̄(b>>3 inverted) R̄'(=1, acc<16) 00 mmm(0F38=010)
-    let r_bar = ((!acc.high1()) & 1) << 7;
-    let x_bar = 1 << 6;
-    let b_bar = ((!b.high1()) & 1) << 5;
-    let r_prime_bar = 1 << 4;
-    let p0 = r_bar | x_bar | b_bar | r_prime_bar | 0b010;
-    em.u8(p0);
-    // P1: W(=0) vvvv(a inverted, 4-bit) 1 pp(=01, 66)
-    let vvvv_inv = ((!a.0) & 0b1111) << 3;
-    let p1 = vvvv_inv | (1 << 2) | 0b01;
-    em.u8(p1);
-    // P2: z(=0) L'L(=01, 256-bit) b(=0) V̄'(=1, a<16) aaa(=0, no mask)
-    let p2 = (0b01 << 5) | (1 << 3);
-    em.u8(p2);
-    // Opcode + ModR/M
+    emit_evex(
+        em,
+        acc.high1(),
+        0, // no index reg
+        b.high1(),
+        0, // R' = 0 (acc < 16)
+        OpcodeMap::M0F38,
+        0, // W = 0
+        a.0,
+        0,    // V' = 0 (a < 16)
+        0b01, // L'L = 01 → 256-bit
+        Prefix::P66,
+    );
     em.u8(0x50);
+    em.u8(0b11_000_000 | (acc.low3() << 3) | b.low3());
+}
+
+// ============================================================================
+// AVX-512 EVEX-encoded ops (Phase 7.R — foundation for ZMM lane width)
+// ============================================================================
+
+/// 512-bit AVX-512 register, 0..=31 (we currently use 0..=15 only).
+///
+/// Same physical register file as `Ymm`; the lane width is selected by the
+/// L'L bits in the EVEX prefix. Use `Zmm` for code that wants ZMM-512
+/// semantics, `Ymm` for YMM-256 (whether the encoding is VEX or EVEX).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Zmm(pub u8);
+
+impl Zmm {
+    pub fn low3(self) -> u8 {
+        self.0 & 0b111
+    }
+    pub fn high1(self) -> u8 {
+        (self.0 >> 3) & 1
+    }
+}
+
+/// Emit a 4-byte EVEX prefix. Generic helper used by every EVEX-encoded op
+/// (ZMM-512 ops, EVEX-256 ops, masked ops if/when we add them).
+///
+/// EVEX layout (Intel SDM Vol. 2A §2.6):
+/// ```text
+/// byte 0 = 0x62
+/// byte 1 (P0) = R̄ X̄ B̄ R̄' 0 0 m m       ; R/X/B/R' inverted; mm = opcode map
+/// byte 2 (P1) = W vvvv 1 p p             ; vvvv inverted; pp = legacy prefix
+/// byte 3 (P2) = z L' L b V̄' a a a         ; L'L = lane width; V̄' inverted
+/// ```
+///
+/// Caller passes *non-inverted* bits (the helper does the inversion).
+/// `mask`/`broadcast`/`zeroing` aren't exposed yet — kept at 0 for now.
+#[allow(clippy::too_many_arguments)] // EVEX genuinely has 10 logical fields
+pub fn emit_evex(
+    em: &mut Emitter,
+    r: u8,       // high bit of ModRM.reg
+    x: u8,       // high bit of SIB.index
+    b: u8,       // high bit of ModRM.rm / SIB.base
+    r_prime: u8, // 5th bit of ModRM.reg (zmm16-31)
+    map: OpcodeMap,
+    w: u8,         // REX.W
+    vvvv: u8,      // 4-bit second source register
+    v_prime: u8,   // 5th bit of vvvv (zmm16-31)
+    l_l_prime: u8, // L'L: 00=128, 01=256, 10=512
+    pp: Prefix,
+) {
+    em.u8(0x62);
+    let r_bar = ((!r) & 1) << 7;
+    let x_bar = ((!x) & 1) << 6;
+    let b_bar = ((!b) & 1) << 5;
+    let r_prime_bar = ((!r_prime) & 1) << 4;
+    let p0 = r_bar | x_bar | b_bar | r_prime_bar | (map as u8);
+    em.u8(p0);
+    let vvvv_inv = ((!vvvv) & 0b1111) << 3;
+    let p1 = (w << 7) | vvvv_inv | (1 << 2) | (pp as u8);
+    em.u8(p1);
+    let v_prime_bar = ((!v_prime) & 1) << 3;
+    let p2 = (l_l_prime << 5) | v_prime_bar;
+    em.u8(p2);
+}
+
+/// `vxorps zmm, zmm, zmm` — zero-idiom for a ZMM register.
+///
+/// Encoding: EVEX.NDS.512.0F.W0 57 /r
+pub fn vxorps_zmm_zero(em: &mut Emitter, dst: Zmm) {
+    emit_evex(
+        em,
+        dst.high1(),
+        0,
+        dst.high1(),
+        0,
+        OpcodeMap::M0F,
+        0,
+        dst.0,
+        0,
+        0b10, // L'L = 10 → 512-bit
+        Prefix::None,
+    );
+    em.u8(0x57);
+    em.u8(0b11_000_000 | (dst.low3() << 3) | dst.low3());
+}
+
+/// `vmovups zmm, [base + index*scale + disp32]` — 512-bit unaligned load.
+///
+/// Encoding: EVEX.512.0F.W0 10 /r
+pub fn vmovups_zmm_load(
+    em: &mut Emitter,
+    dst: Zmm,
+    base: Reg,
+    index: Option<(Reg, Scale)>,
+    disp: i32,
+) {
+    let x = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    emit_evex(
+        em,
+        dst.high1(),
+        x,
+        base.high1(),
+        0,
+        OpcodeMap::M0F,
+        0,
+        0,
+        0,
+        0b10,
+        Prefix::None,
+    );
+    em.u8(0x10);
+    emit_modrm_sib_disp32(em, dst.low3(), base, index, disp);
+}
+
+/// `vbroadcastss zmm, [base + index*scale + disp32]` — broadcast a 32-bit
+/// scalar from memory into all 16 lanes of a ZMM.
+///
+/// Encoding: EVEX.512.66.0F38.W0 18 /r
+pub fn vbroadcastss_zmm(
+    em: &mut Emitter,
+    dst: Zmm,
+    base: Reg,
+    index: Option<(Reg, Scale)>,
+    disp: i32,
+) {
+    let x = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    emit_evex(
+        em,
+        dst.high1(),
+        x,
+        base.high1(),
+        0,
+        OpcodeMap::M0F38,
+        0,
+        0,
+        0,
+        0b10,
+        Prefix::P66,
+    );
+    em.u8(0x18);
+    emit_modrm_sib_disp32(em, dst.low3(), base, index, disp);
+}
+
+/// `vfmadd231ps zmm_acc, zmm_a, [base + index*scale + disp32]`
+/// — `acc = acc + a * b` where b is a 16-lane fp32 load from memory.
+///
+/// Encoding: EVEX.DDS.512.66.0F38.W0 B8 /r
+pub fn vfmadd231ps_zmm_mem(
+    em: &mut Emitter,
+    acc: Zmm,
+    a: Zmm,
+    base: Reg,
+    index: Option<(Reg, Scale)>,
+    disp: i32,
+) {
+    let x = index.map(|(i, _)| i.high1()).unwrap_or(0);
+    emit_evex(
+        em,
+        acc.high1(),
+        x,
+        base.high1(),
+        0,
+        OpcodeMap::M0F38,
+        0,
+        a.0,
+        0,
+        0b10,
+        Prefix::P66,
+    );
+    em.u8(0xB8);
+    emit_modrm_sib_disp32(em, acc.low3(), base, index, disp);
+}
+
+/// `vfmadd231ps zmm_acc, zmm_a, zmm_b` — same FMA but b is in a register.
+///
+/// Encoding: EVEX.DDS.512.66.0F38.W0 B8 /r (reg form)
+pub fn vfmadd231ps_zmm_reg(em: &mut Emitter, acc: Zmm, a: Zmm, b: Zmm) {
+    emit_evex(
+        em,
+        acc.high1(),
+        0,
+        b.high1(),
+        0,
+        OpcodeMap::M0F38,
+        0,
+        a.0,
+        0,
+        0b10,
+        Prefix::P66,
+    );
+    em.u8(0xB8);
     em.u8(0b11_000_000 | (acc.low3() << 3) | b.low3());
 }
 
@@ -964,7 +1144,61 @@ mod tests {
     fn encodes_vpdpbusd_evex_reg() {
         // `vpdpbusd ymm0, ymm0, ymm0` EVEX-256 form.
         // Expected exact: 62 F2 7D 28 50 C0
+        // Also serves as the regression check for the generic `emit_evex`
+        // helper — Phase 7.R refactored the manual byte-building here to
+        // route through it.
         let bytes = enc(|e| vpdpbusd_evex_reg(e, Ymm(0), Ymm(0), Ymm(0)));
         assert_eq!(bytes, vec![0x62, 0xF2, 0x7D, 0x28, 0x50, 0xC0]);
+    }
+
+    // ---- AVX-512 ZMM (Phase 7.R) -----------------------------------------
+
+    #[test]
+    fn encodes_vxorps_zmm_zero() {
+        // `vxorps zmm0, zmm0, zmm0` EVEX-512.
+        // L'L = 10 (512-bit), pp = 00, mmm = 01 (0F), opcode 0x57.
+        let bytes = enc(|e| vxorps_zmm_zero(e, Zmm(0)));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x57));
+        // P2 low byte should have L'L=10 in bits 5-6 → 0b0100_1000 = 0x48.
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vmovups_zmm_load() {
+        // `vmovups zmm0, [rdx]`. EVEX.512.0F.W0 10 /r
+        let bytes = enc(|e| vmovups_zmm_load(e, Zmm(0), Reg::RDX, None, 0));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x10));
+        assert_eq!(bytes[3], 0x48); // L'L = 10
+    }
+
+    #[test]
+    fn encodes_vbroadcastss_zmm() {
+        // `vbroadcastss zmm0, [rcx]`. EVEX.512.66.0F38.W0 18 /r
+        let bytes = enc(|e| vbroadcastss_zmm(e, Zmm(0), Reg::RCX, None, 0));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0x18));
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vfmadd231ps_zmm_mem() {
+        // `vfmadd231ps zmm0, zmm0, [r13 + rax*4]`. EVEX.DDS.512.66.0F38.W0 B8.
+        let bytes = enc(|e| {
+            vfmadd231ps_zmm_mem(e, Zmm(0), Zmm(0), Reg::R13, Some((Reg::RAX, Scale::S4)), 0)
+        });
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0xB8));
+        assert_eq!(bytes[3], 0x48);
+    }
+
+    #[test]
+    fn encodes_vfmadd231ps_zmm_reg() {
+        // `vfmadd231ps zmm0, zmm0, zmm0`. EVEX reg form.
+        let bytes = enc(|e| vfmadd231ps_zmm_reg(e, Zmm(0), Zmm(0), Zmm(0)));
+        assert_eq!(bytes[0], 0x62);
+        assert!(bytes.contains(&0xB8));
+        assert_eq!(bytes[3], 0x48);
     }
 }
