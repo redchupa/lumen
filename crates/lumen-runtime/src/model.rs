@@ -751,6 +751,152 @@ pub fn forward_layer(
     resid
 }
 
+/// Phase 8.D.2: JIT prefill layer forward.
+///
+/// Same math as [`forward_layer`] (no-cache, multi-token attention) but the
+/// five weight projections (Q/K/V/wo/gate/up/down) go through the batched
+/// Q8 (or F32) matmul JIT instead of the naive triple loop. RMSNorm, RoPE,
+/// the attention itself, SiLU/mul, and residual stay on the naive paths —
+/// they're a small fraction of the work (Phase 7.U: ~6.5% of total at
+/// decode, smaller at prefill since matmul scales with seq while the rest
+/// is per-token-cheap).
+///
+/// As a side effect, appends each token's K/V row to the layer cache in
+/// order. So the caller can immediately switch to `forward_layer_decode_jit`
+/// for the first generated token.
+///
+/// Layout invariants (same as forward_layer):
+/// - `x`: `[seq, hidden]` row-major
+/// - `positions`: `[seq]`, one position per row
+/// - returns: `[seq, hidden]` row-major
+///
+/// Requires `seq == 1` or `seq % 8 == 0` because the Q8 prefill matmul kernel
+/// only emits N=1 (decode) or N%8==0 (prefill) code paths. The caller is
+/// expected to chunk longer prompts; for the typical "안녕"-style 2-token
+/// prompt this restriction matters and is handled at the dispatch level
+/// (see Self::forward_prefill_jit, added in a follow-up commit).
+#[allow(dead_code)] // wired in by forward_prefill_jit in the next commit
+pub fn forward_layer_prefill_jit(
+    x: &[f32],
+    seq: usize,
+    layer: &LayerWeights,
+    cache: &mut LayerKvCache,
+    positions: &[u32],
+    cfg: &LayerConfig,
+    jit: &mut MatmulJitCache,
+) -> Vec<f32> {
+    assert_eq!(x.len(), seq * cfg.hidden);
+    assert_eq!(positions.len(), seq);
+    debug_assert!(
+        seq == 1 || seq % 8 == 0,
+        "Q8 prefill kernel requires seq=1 or seq%8==0; got seq={}",
+        seq
+    );
+
+    // --- 1. attention RMSNorm ---
+    let mut x_norm = vec![0.0f32; x.len()];
+    rms_norm(
+        x,
+        &layer.attn_norm_w,
+        &mut x_norm,
+        cfg.hidden,
+        cfg.rms_norm_eps,
+    );
+
+    // --- 2. Q / K / V projection (batched JIT) ---
+    let mut q = weight_matmul_jit_batched(&x_norm, &layer.wq, seq, cfg.hidden, cfg.q_dim(), jit);
+    let mut k = weight_matmul_jit_batched(&x_norm, &layer.wk, seq, cfg.hidden, cfg.kv_dim(), jit);
+    let mut v = weight_matmul_jit_batched(&x_norm, &layer.wv, seq, cfg.hidden, cfg.kv_dim(), jit);
+    if let Some(b) = &layer.b_q {
+        add_bias_broadcast(&mut q, b, cfg.q_dim());
+    }
+    if let Some(b) = &layer.b_k {
+        add_bias_broadcast(&mut k, b, cfg.kv_dim());
+    }
+    if let Some(b) = &layer.b_v {
+        add_bias_broadcast(&mut v, b, cfg.kv_dim());
+    }
+
+    // --- 3. RoPE on Q and K ---
+    rope_in_place(&mut q, positions, cfg.n_heads, cfg.head_dim, cfg.rope_base);
+    rope_in_place(
+        &mut k,
+        positions,
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        cfg.rope_base,
+    );
+
+    // --- 4. attention (no cache; computes Q·K^T for all `seq` query rows
+    //         against the same `seq` key rows) ---
+    let attn = multi_head_attention(&q, &k, &v, seq, cfg);
+
+    // --- 5. output projection (batched JIT) ---
+    let attn_out = weight_matmul_jit_batched(&attn, &layer.wo, seq, cfg.q_dim(), cfg.hidden, jit);
+
+    // --- 6. residual ---
+    let mut resid: Vec<f32> = x.iter().zip(attn_out.iter()).map(|(a, b)| a + b).collect();
+
+    // --- 7. FFN RMSNorm ---
+    let mut ffn_in = vec![0.0f32; resid.len()];
+    rms_norm(
+        &resid,
+        &layer.ffn_norm_w,
+        &mut ffn_in,
+        cfg.hidden,
+        cfg.rms_norm_eps,
+    );
+
+    // --- 8. gate / up projection (batched JIT) ---
+    let mut gate = weight_matmul_jit_batched(
+        &ffn_in,
+        &layer.w_gate,
+        seq,
+        cfg.hidden,
+        cfg.ffn_hidden,
+        jit,
+    );
+    let up = weight_matmul_jit_batched(
+        &ffn_in,
+        &layer.w_up,
+        seq,
+        cfg.hidden,
+        cfg.ffn_hidden,
+        jit,
+    );
+
+    // --- 9. SiLU(gate) * up ---
+    silu_in_place(&mut gate);
+    mul_in_place(&mut gate, &up);
+
+    // --- 10. down projection (batched JIT) ---
+    let ffn_out = weight_matmul_jit_batched(
+        &gate,
+        &layer.w_down,
+        seq,
+        cfg.ffn_hidden,
+        cfg.hidden,
+        jit,
+    );
+
+    // --- 11. residual ---
+    for (r, o) in resid.iter_mut().zip(ffn_out.iter()) {
+        *r += *o;
+    }
+
+    // --- 12. populate KV cache with this batch's K/V rows in order. Done
+    //         at the end so the cache stays untouched if any earlier step
+    //         panics. Caller can now switch to the decode path. ---
+    let kv = cfg.kv_dim();
+    for t in 0..seq {
+        let k_row = &k[t * kv..(t + 1) * kv];
+        let v_row = &v[t * kv..(t + 1) * kv];
+        cache.append(k_row, v_row);
+    }
+
+    resid
+}
+
 /// Cache-backed attention for a single query token at position `cur_pos`.
 ///
 /// Inputs:
@@ -1969,6 +2115,112 @@ mod tests {
                 tol
             );
         }
+    }
+
+    /// Toy layer config sized so every dim plays nicely with the Q8 kernel
+    /// constraints: `d_in % 32 == 0` (one Q8 block = 32 elements), every
+    /// output dim divisible by 8 (Q8 prefill N-stride), and a small attention
+    /// shape that exercises both Q and KV head paths.
+    fn prefill_cfg() -> LayerConfig {
+        LayerConfig {
+            hidden: 32,
+            n_heads: 4,
+            n_kv_heads: 2, // GQA, heads_per_kv = 2
+            head_dim: 8,   // n_heads * head_dim = 32 = hidden
+            ffn_hidden: 64,
+            rms_norm_eps: 1e-5,
+            rope_base: 10000.0,
+        }
+    }
+
+    /// Build a `LayerWeights` where every weight matrix is stored as Q8.
+    /// `seed` drives the same xorshift PRNG as `random_weights`.
+    fn random_weights_q8(cfg: &LayerConfig, seed: u64) -> LayerWeights {
+        let mut s = seed | 1;
+        let mut next = || -> f32 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s as i32 as f32) * 1e-10
+        };
+        let h = cfg.hidden;
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+        let ff = cfg.ffn_hidden;
+
+        let mk_q8 = |n: usize, next: &mut dyn FnMut() -> f32| -> WeightStorage {
+            let raw: Vec<f32> = (0..n).map(|_| next()).collect();
+            let mut blocks = vec![
+                BlockQ8_0 {
+                    d: 0,
+                    qs: [0i8; 32],
+                };
+                n / QK
+            ];
+            quantize_q8_0(&raw, &mut blocks);
+            WeightStorage::Q8(blocks)
+        };
+
+        LayerWeights {
+            attn_norm_w: vec![1.0; h],
+            wq: mk_q8(qd * h, &mut next),
+            wk: mk_q8(kvd * h, &mut next),
+            wv: mk_q8(kvd * h, &mut next),
+            wo: mk_q8(h * qd, &mut next),
+            ffn_norm_w: vec![1.0; h],
+            w_gate: mk_q8(ff * h, &mut next),
+            w_up: mk_q8(ff * h, &mut next),
+            w_down: mk_q8(h * ff, &mut next),
+            b_q: None,
+            b_k: None,
+            b_v: None,
+        }
+    }
+
+    /// Phase 8.D.2 correctness: `forward_layer_prefill_jit` must produce the
+    /// same hidden state as `forward_layer` (the naive reference) on the
+    /// same Q8 weights. Tolerance absorbs fp32 reduction rounding only —
+    /// both paths see the *same* (quantized) weights, so Q8 quantization
+    /// error cancels.
+    #[test]
+    fn forward_layer_prefill_jit_matches_naive() {
+        use lumen_jit::MatmulJitCache;
+        let cfg = prefill_cfg();
+        let layer = random_weights_q8(&cfg, 2026);
+        let seq = 8usize; // smallest viable prefill batch (Q8 N%8==0)
+
+        let x: Vec<f32> = (0..seq * cfg.hidden)
+            .map(|i| ((i % 13) as f32) * 0.05 - 0.15)
+            .collect();
+        let positions: Vec<u32> = (0..seq as u32).collect();
+
+        let want = forward_layer(&x, seq, &layer, &positions, &cfg);
+
+        let mut cache = LayerKvCache::new(seq, cfg.kv_dim());
+        let mut jit = MatmulJitCache::new();
+        let got = forward_layer_prefill_jit(
+            &x, seq, &layer, &mut cache, &positions, &cfg, &mut jit,
+        );
+
+        assert_eq!(got.len(), want.len());
+        // Q8 weights are bit-identical between the two paths; the only error
+        // source is fp32 reduction order. Tolerance scales with K — the
+        // longest reduction here is `hidden + ffn_hidden = 96` fp32 sums.
+        let tol = 1e-3 * (cfg.hidden as f32 + cfg.ffn_hidden as f32);
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < tol,
+                "prefill_jit row {} dim {}: jit={} naive={} diff={}",
+                i / cfg.hidden,
+                i % cfg.hidden,
+                g,
+                w,
+                (g - w).abs()
+            );
+        }
+
+        // KV cache must hold `seq` rows after the call (side effect contract).
+        assert_eq!(cache.len(), seq);
     }
 
     /// `rows == 1` should still produce the decode-path answer. Regression
