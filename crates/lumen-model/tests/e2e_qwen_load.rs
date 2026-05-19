@@ -318,6 +318,55 @@ fn qwen_bench_tg32_jit_repeated() {
     }
 }
 
+/// Phase 8.D.3 diagnostic: how much of the pp32 wall is `multi_head_attention`?
+/// pp32 measured 22.65 tok/s (1.41s for 32+1 tokens) — about 3× slower than
+/// tg32. The hypothesis is that the naive multi_head_attention's O(seq²)
+/// behaviour dominates. This isolates the cost by running just the attention
+/// call (skipping all matmul / norm / RoPE / projections) on representative
+/// shapes.
+#[test]
+#[ignore = "diagnostic — runs in <1s but only useful when investigating prefill regression"]
+fn qwen_diag_multi_head_attention_only() {
+    use lumen_runtime::{multi_head_attention, LayerConfig};
+
+    // Match Qwen2.5-0.5B's layer config: 14 Q heads, 2 KV heads (GQA),
+    // head_dim=64, so q_dim=896, kv_dim=128.
+    let cfg = LayerConfig {
+        hidden: 896,
+        n_heads: 14,
+        n_kv_heads: 2,
+        head_dim: 64,
+        ffn_hidden: 4864,
+        rms_norm_eps: 1e-5,
+        rope_base: 1_000_000.0,
+    };
+
+    for &seq in &[1usize, 8, 16, 32, 64] {
+        let q = vec![0.01f32; seq * cfg.q_dim()];
+        let k = vec![0.01f32; seq * cfg.kv_dim()];
+        let v = vec![0.01f32; seq * cfg.kv_dim()];
+
+        // Warm: JIT cache / branch predictor / L2 pre-touch.
+        let _ = multi_head_attention(&q, &k, &v, seq, &cfg);
+
+        // 24 layers × 33 forward passes (prompt 32 + 1 decode) gives total
+        // call count, but per-call timing is what we care about here.
+        let n_calls = 24; // one layer's worth, repeated for stable timing
+        let t = std::time::Instant::now();
+        for _ in 0..n_calls {
+            let _ = multi_head_attention(&q, &k, &v, seq, &cfg);
+        }
+        let total = t.elapsed();
+        let per_call = total / n_calls as u32;
+        eprintln!(
+            "attention seq={:>3}: {:>7.2}µs/call (24 calls in {:?})",
+            seq,
+            per_call.as_secs_f64() * 1e6,
+            total
+        );
+    }
+}
+
 /// Phase 8.D.3 bench: prefill timing. Compares the time it takes to
 /// process a fixed-length prompt through the model (no generation), with
 /// and without batched-matmul prefill. Eight tokens is the smallest chunk
