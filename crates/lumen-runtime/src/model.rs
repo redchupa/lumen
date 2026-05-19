@@ -278,6 +278,104 @@ fn use_vnni_for_matmul(d_in: usize) -> bool {
     (d_in / 32) <= 64
 }
 
+/// Phase 8.D.1: prefill (batched) variant of [`weight_matmul_jit_storage`].
+/// Same math as the naive `weight_matmul(a, w, rows, d_in, d_out)` —
+/// `a` is `[rows, d_in]` row-major, weight is `[d_out, d_in]` (or
+/// `[d_in, d_out]` after `transpose_in_place`), output is `[rows, d_out]`.
+///
+/// F32 path (post-transpose layout `[d_in, d_out]`): direct call into the
+/// generic `compile_matmul(rows, d_in, d_out)` kernel — no reshaping.
+///
+/// Q8 path (native `[d_out, d_in]` layout): the Q8 JIT kernel computes
+/// `W[d_out, d_in] @ B[d_in, n] = C[d_out, n]`. To make our `[rows, d_in]`
+/// activations and `[rows, d_out]` outputs line up we transpose the
+/// activation in and the output back. The cost is `O(rows · (d_in + d_out))`
+/// fp32 copies per matmul — small next to the `O(rows · d_in · d_out)`
+/// compute, and an easy place to optimize later if it shows up in profiles.
+///
+/// `rows == 1` collapses to the decode path; the transposes become no-ops
+/// (single column == single row), so this can replace
+/// `weight_matmul_jit_storage` at no cost. The regression guard in
+/// `phase8d_q8_prefill::q8_n1_decode_still_matches_naive` covers that.
+#[allow(dead_code)] // wired into forward_layer_prefill_jit in a follow-up commit
+fn weight_matmul_jit_batched(
+    a: &[f32],
+    w: &WeightStorage,
+    rows: usize,
+    d_in: usize,
+    d_out: usize,
+    jit: &mut MatmulJitCache,
+) -> Vec<f32> {
+    debug_assert_eq!(a.len(), rows * d_in);
+    debug_assert_eq!(w.nelem(), d_out * d_in);
+
+    let mut out = vec![0.0f32; rows * d_out];
+    match w {
+        WeightStorage::F32(buf) => {
+            // F32 weights have been `transpose_in_place`'d to [d_in, d_out].
+            // That's exactly the `B[K, N]` layout the generic matmul wants.
+            let f = jit
+                .get_or_compile(rows as u32, d_in as u32, d_out as u32)
+                .expect("f32 matmul JIT compile (batched)");
+            // SAFETY: kernel compiled for these exact (M=rows, K=d_in, N=d_out)
+            // dims; both buffers sized to match.
+            unsafe {
+                f(a.as_ptr(), buf.as_ptr(), out.as_mut_ptr());
+            }
+        }
+        WeightStorage::Q8(weight_blocks) => {
+            // Q8 weight is `[d_out, d_in]`. The Q8 kernel signature is
+            // `W[m, k] @ B[k, n] -> C[m, n]`, so we plug:
+            //   m = d_out, k = d_in, n = rows
+            // and feed it `a` transposed from `[rows, d_in]` to `[d_in, rows]`.
+            let a_t = transpose_2d_view(a, rows, d_in);
+            let f = jit
+                .get_or_compile_q8(d_out as u32, d_in as u32, rows as u32)
+                .expect("q8 matmul JIT compile (batched)");
+            let mut out_t = vec![0.0f32; d_out * rows];
+            // SAFETY: kernel compiled for (m=d_out, k=d_in, n=rows); buffers
+            // sized accordingly.
+            unsafe {
+                f(
+                    weight_blocks.as_ptr() as *const u8,
+                    a_t.as_ptr(),
+                    out_t.as_mut_ptr(),
+                );
+            }
+            // Transpose the result back to `[rows, d_out]`.
+            transpose_2d_into(&out_t, d_out, rows, &mut out);
+        }
+    }
+    out
+}
+
+/// Transpose `[rows, cols]` row-major into a fresh `[cols, rows]` row-major
+/// allocation. Local helper for `weight_matmul_jit_batched`; the public
+/// `transpose_2d` above has fixed dim names that don't read well here.
+fn transpose_2d_view(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    debug_assert_eq!(src.len(), rows * cols);
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = src[r * cols + c];
+        }
+    }
+    out
+}
+
+/// Transpose `[rows, cols]` row-major into a caller-provided `[cols, rows]`
+/// row-major buffer. Avoids the extra allocation when the destination is
+/// already sized.
+fn transpose_2d_into(src: &[f32], rows: usize, cols: usize, dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), rows * cols);
+    debug_assert_eq!(dst.len(), rows * cols);
+    for r in 0..rows {
+        for c in 0..cols {
+            dst[c * rows + r] = src[r * cols + c];
+        }
+    }
+}
+
 /// Activation-quantized variant of [`weight_matmul_jit_storage`]. Caller
 /// supplies the activation pre-quantized to Q8_0 blocks (typically reused
 /// across the Q/K/V projections from one RMSNorm output). For F32 weights
@@ -1774,5 +1872,139 @@ mod tests {
         // Should stop at the first generated token (the one that equals EOS).
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], probe[0]);
+    }
+
+    /// Phase 8.D.1: `weight_matmul_jit_batched` must match `weight_matmul`
+    /// (the naive reference) on F32 weights once they've been
+    /// `transpose_in_place`'d for the JIT layout. Toy shape so the test runs
+    /// fast and dlltool-free.
+    #[test]
+    fn weight_matmul_jit_batched_matches_naive_f32() {
+        use lumen_jit::MatmulJitCache;
+        let rows = 4usize;
+        let d_in = 8usize;
+        let d_out = 16usize;
+
+        let a: Vec<f32> = (0..rows * d_in)
+            .map(|i| ((i % 13) as f32) * 0.07 - 0.2)
+            .collect();
+        // Naive convention weight is [d_out, d_in].
+        let w_native: Vec<f32> = (0..d_out * d_in)
+            .map(|i| ((i % 17) as f32) * 0.05 + 0.01)
+            .collect();
+
+        let want = weight_matmul(&a, &w_native, rows, d_in, d_out);
+
+        // The JIT path consumes the [d_in, d_out] layout, so transpose once.
+        let w_t = transpose_2d(&w_native, d_out, d_in);
+        let storage = WeightStorage::F32(w_t);
+        let mut cache = MatmulJitCache::new();
+        let got = weight_matmul_jit_batched(&a, &storage, rows, d_in, d_out, &mut cache);
+
+        assert_eq!(got.len(), want.len());
+        let tol = 1e-3 * (d_in as f32);
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < tol,
+                "f32 mismatch at idx {}: jit={} naive={} diff={} tol={}",
+                i,
+                g,
+                w,
+                (g - w).abs(),
+                tol
+            );
+        }
+    }
+
+    /// Phase 8.D.1: same check for Q8 weights. We compare JIT against
+    /// dequantize-then-naive on the *same* quantized weights, so the
+    /// tolerance only has to absorb fp32 reduction rounding, not Q8
+    /// quantization error.
+    #[test]
+    fn weight_matmul_jit_batched_matches_naive_q8() {
+        use lumen_jit::MatmulJitCache;
+        // K=32 (one Q8 block); rows>1 exercises the prefill code path.
+        // The Q8 kernel needs N=1 or N%8==0, and N maps to rows in our
+        // batched dispatch, so use 8 to hit the actual prefill code path.
+        let rows = 8usize;
+        let d_in = 32usize;
+        let d_out = 8usize;
+
+        let a: Vec<f32> = (0..rows * d_in)
+            .map(|i| ((i % 11) as f32) * 0.07 + 0.03)
+            .collect();
+
+        // Build a Q8 weight by quantizing a synthetic [d_out, d_in] matrix.
+        let w_f32: Vec<f32> = (0..d_out * d_in)
+            .map(|i| ((i % 19) as f32) * 0.04 - 0.1)
+            .collect();
+        let mut w_q8 = vec![
+            BlockQ8_0 {
+                d: 0,
+                qs: [0i8; 32],
+            };
+            d_out * d_in / QK
+        ];
+        quantize_q8_0(&w_f32, &mut w_q8);
+        // Reference: dequantize and run the naive path on the (now slightly
+        // lossy) [d_out, d_in] matrix. JIT operates on the same Q8 blocks.
+        let mut w_dq = vec![0.0f32; d_out * d_in];
+        dequantize_q8_0(&w_q8, &mut w_dq);
+        let want = weight_matmul(&a, &w_dq, rows, d_in, d_out);
+
+        let storage = WeightStorage::Q8(w_q8);
+        let mut cache = MatmulJitCache::new();
+        let got = weight_matmul_jit_batched(&a, &storage, rows, d_in, d_out, &mut cache);
+
+        assert_eq!(got.len(), want.len());
+        let tol = 1e-3 * (d_in as f32);
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < tol,
+                "q8 mismatch at idx {}: jit={} naive={} diff={} tol={}",
+                i,
+                g,
+                w,
+                (g - w).abs(),
+                tol
+            );
+        }
+    }
+
+    /// `rows == 1` should still produce the decode-path answer. Regression
+    /// guard for the transpose helpers when one of the dims collapses.
+    #[test]
+    fn weight_matmul_jit_batched_rows1_matches_naive_q8() {
+        use lumen_jit::MatmulJitCache;
+        let rows = 1usize;
+        let d_in = 32usize;
+        let d_out = 16usize;
+
+        let a: Vec<f32> = (0..rows * d_in)
+            .map(|i| ((i % 7) as f32) * 0.1)
+            .collect();
+        let w_f32: Vec<f32> = (0..d_out * d_in)
+            .map(|i| ((i % 13) as f32) * 0.06)
+            .collect();
+        let mut w_q8 = vec![
+            BlockQ8_0 {
+                d: 0,
+                qs: [0i8; 32],
+            };
+            d_out * d_in / QK
+        ];
+        quantize_q8_0(&w_f32, &mut w_q8);
+        let mut w_dq = vec![0.0f32; d_out * d_in];
+        dequantize_q8_0(&w_q8, &mut w_dq);
+        let want = weight_matmul(&a, &w_dq, rows, d_in, d_out);
+
+        let storage = WeightStorage::Q8(w_q8);
+        let mut cache = MatmulJitCache::new();
+        let got = weight_matmul_jit_batched(&a, &storage, rows, d_in, d_out, &mut cache);
+
+        let tol = 1e-3 * (d_in as f32);
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() < tol);
+        }
     }
 }
