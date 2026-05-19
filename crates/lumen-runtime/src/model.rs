@@ -297,7 +297,6 @@ fn use_vnni_for_matmul(d_in: usize) -> bool {
 /// (single column == single row), so this can replace
 /// `weight_matmul_jit_storage` at no cost. The regression guard in
 /// `phase8d_q8_prefill::q8_n1_decode_still_matches_naive` covers that.
-#[allow(dead_code)] // wired into forward_layer_prefill_jit in a follow-up commit
 fn weight_matmul_jit_batched(
     a: &[f32],
     w: &WeightStorage,
@@ -775,7 +774,6 @@ pub fn forward_layer(
 /// expected to chunk longer prompts; for the typical "안녕"-style 2-token
 /// prompt this restriction matters and is handled at the dispatch level
 /// (see Self::forward_prefill_jit, added in a follow-up commit).
-#[allow(dead_code)] // wired in by forward_prefill_jit in the next commit
 pub fn forward_layer_prefill_jit(
     x: &[f32],
     seq: usize,
@@ -1543,6 +1541,87 @@ impl Model {
         );
     }
 
+    /// Phase 8.D.3: batched (prefill) variant of [`Self::forward_decode_jit`].
+    ///
+    /// Processes a chunk of `chunk.len()` consecutive tokens through every
+    /// layer in one shot, appending their K/V rows to the cache in order.
+    /// Returns the logits of the *last* token in the chunk (the only ones
+    /// generation needs); the lm_head projection is therefore M=1 again, so
+    /// only the per-layer matmuls actually pay the batched dispatch overhead.
+    ///
+    /// Constraint: `chunk.len()` must be 1 or a multiple of 8 (Q8 prefill
+    /// kernel's N stride). `generate_greedy_jit` enforces this by chunking
+    /// the prompt at the dispatch level — short prompts (<8) fall through
+    /// to the existing decode-by-token path.
+    ///
+    /// Caller must have called [`Self::transpose_for_jit`] first.
+    pub fn forward_prefill_jit(
+        &self,
+        chunk: &[u32],
+        first_position: u32,
+        cache: &mut KvCache,
+        jit: &mut MatmulJitCache,
+    ) -> Vec<f32> {
+        assert!(!chunk.is_empty());
+        assert!(
+            chunk.len() == 1 || chunk.len() % 8 == 0,
+            "forward_prefill_jit chunk len must be 1 or %8==0; got {}",
+            chunk.len()
+        );
+        assert_eq!(cache.n_layers(), self.config.n_layers);
+
+        let seq = chunk.len();
+        let h = self.config.hidden();
+
+        // Embed every token in the chunk into a [seq, hidden] row-major slab.
+        let mut x = Vec::with_capacity(seq * h);
+        for &tok in chunk {
+            let off = tok as usize * h;
+            x.extend_from_slice(&self.token_embeddings[off..off + h]);
+        }
+
+        let positions: Vec<u32> = (0..seq as u32).map(|i| first_position + i).collect();
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = forward_layer_prefill_jit(
+                &x,
+                seq,
+                layer,
+                cache.layer_mut(i),
+                &positions,
+                &self.config.layer,
+                jit,
+            );
+        }
+
+        // Final RMSNorm over the *last* row only — we throw away all earlier
+        // rows here, so no point normalizing them.
+        let last_row = &x[(seq - 1) * h..seq * h];
+        let mut x_norm = vec![0.0f32; h];
+        rms_norm(
+            last_row,
+            &self.final_norm_w,
+            &mut x_norm,
+            h,
+            self.config.layer.rms_norm_eps,
+        );
+
+        // lm_head: M=1 projection over the vocab — identical to the decode
+        // path's lm_head, so reuse the same kernel selection.
+        if use_vnni_for_matmul(h) {
+            let x_norm_q8 = quantize_activation_q8(&x_norm);
+            weight_matmul_jit_storage_q8act(
+                &x_norm_q8,
+                &self.lm_head_w,
+                h,
+                self.config.vocab_size,
+                jit,
+            )
+        } else {
+            weight_matmul_jit_storage(&x_norm, &self.lm_head_w, h, self.config.vocab_size, jit)
+        }
+    }
+
     /// JIT variant of [`Self::forward_decode`]. Caller must have called
     /// [`Self::transpose_for_jit`] first.
     pub fn forward_decode_jit(
@@ -1708,9 +1787,28 @@ impl Model {
         );
         let mut jit = MatmulJitCache::new();
 
+        // Phase 8.D.3: prefill via batched matmul whenever there are at least
+        // 8 prompt tokens left. The Q8 prefill kernel only takes N=1 or
+        // N%8==0, so we eat the largest 8-multiple first, then handle the
+        // tail one token at a time on the decode path. For short prompts
+        // (<8 tokens, e.g. the "안녕" 2-token bench) this is a pure no-op —
+        // we fall straight through to the per-token decode loop and match
+        // the v0.4.0 behaviour byte-for-byte.
         let mut last_logits = Vec::new();
-        for (pos, &tok) in prompt.iter().enumerate() {
-            last_logits = self.forward_decode_jit(tok, pos as u32, &mut cache, &mut jit);
+        let mut pos = 0usize;
+        let plen = prompt.len();
+        while plen - pos >= 8 {
+            let chunk_end = pos + ((plen - pos) / 8) * 8;
+            let chunk = &prompt[pos..chunk_end];
+            last_logits = self.forward_prefill_jit(chunk, pos as u32, &mut cache, &mut jit);
+            pos = chunk_end;
+        }
+        // Remaining prompt tokens (0..8) fall through to the per-token decode
+        // path. This also covers the typical "short prompt + decode" case
+        // entirely with no behaviour change vs Phase 8.A.
+        while pos < plen {
+            last_logits = self.forward_decode_jit(prompt[pos], pos as u32, &mut cache, &mut jit);
+            pos += 1;
         }
 
         let mut out = Vec::with_capacity(max_new);
@@ -1720,7 +1818,7 @@ impl Model {
             if Some(next) == self.config.eos_token_id {
                 break;
             }
-            let next_pos = (prompt.len() + i) as u32;
+            let next_pos = (plen + i) as u32;
             last_logits = self.forward_decode_jit(next, next_pos, &mut cache, &mut jit);
         }
         out

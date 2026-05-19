@@ -318,6 +318,48 @@ fn qwen_bench_tg32_jit_repeated() {
     }
 }
 
+/// Phase 8.D.3 bench: prefill timing. Compares the time it takes to
+/// process a fixed-length prompt through the model (no generation), with
+/// and without batched-matmul prefill. Eight tokens is the smallest chunk
+/// that hits the prefill kernel; 32 is the same length llama-bench uses
+/// for its tg32 generation column, giving us a directly comparable number
+/// against ggml's `pp32` (if we tell llama-bench `-p 32`).
+#[test]
+#[ignore = "loads ~640MB; for benchmarking only"]
+fn qwen_bench_pp32() {
+    if !check_qwen_present() {
+        eprintln!("skip: {} not present", QWEN_PATH);
+        return;
+    }
+    let file = GgufFile::open(QWEN_PATH).expect("open gguf");
+    let mut model = model_from_gguf(&file, "qwen2").expect("model");
+    let tok = Tokenizer::from_gguf(&file).expect("tokenizer");
+    model.transpose_for_jit();
+
+    // Build a 32-token prompt. Synthetic IDs in the small-ID range are fine
+    // for timing — we never look at the generated tokens, just the wall.
+    let prompt: Vec<u32> = (1..=32).collect();
+
+    // Warm: JIT-compile the kernels and load the weight pages into cache.
+    let _ = model.generate_greedy_jit(&prompt, 1);
+
+    // Time the same call again on warm state.
+    let t = std::time::Instant::now();
+    let _ = model.generate_greedy_jit(&prompt, 1);
+    let elapsed = t.elapsed();
+    // pp metric: tokens processed per second during prefill. Subtract one
+    // decode step from the wall (the single generated token) to isolate
+    // the prefill cost. For a 32-token prompt the decode step is ~15ms
+    // out of a much larger total — close enough not to bother for now.
+    let prefill_tps = prompt.len() as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "Lumen JIT pp32: {} prompt tokens in {:?}  =>  {:.2} tok/s",
+        prompt.len(),
+        elapsed,
+        prefill_tps
+    );
+}
+
 /// Phase 7.A bench: run Qwen2.5-0.5B for 32 decode tokens via the JIT path
 /// so we can compare against llama-bench `tg32`. Single-threaded — matches
 /// our backend's thread model.
