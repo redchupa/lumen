@@ -3,7 +3,7 @@
 > **IR이 양자화 커널을 자동 합성하는** LLM 추론 컴파일러 + 런타임.
 > 한국어 LLM(EXAONE, HyperCLOVA-X, A.X) 추론도 1급으로 지원.
 
-[![Build](https://img.shields.io/badge/build-passing-green)](#) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#) [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](#) [![Version](https://img.shields.io/badge/version-v0.4.0-brightgreen)](#)
+[![Build](https://img.shields.io/badge/build-passing-green)](#) [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#) [![Rust](https://img.shields.io/badge/rust-1.78%2B-orange)](#) [![Version](https://img.shields.io/badge/version-v0.5.0-brightgreen)](#)
 
 ---
 
@@ -49,34 +49,45 @@ PyTorch나 ONNX Runtime처럼 기성 그래프 컴파일러를 갖다 쓰는 것
 | 7.A. **vs llama.cpp 벤치** | tg32 단일 스레드: naive 2.91 / JIT 4.43 / ggml 41.32 tok/s | ✅ **완료** |
 | 7.C. 1×N 4-acc decode kernel | M=1 N%32 FMA 종속성 체인 해체, 4.43→5.08 tok/s | ✅ 완료 |
 | 7.D. **Q8-native fused matmul (model path)** | dequant 패스 제거 + 메모리 대역 4× 회복, 5.08→17.97 tok/s | ✅ **완료** |
-| 2.C. ARM64 backend | AAPCS64, NEON-readiness | ⏳ |
-| 3.D. 캐시 타일링 (prefill) | Mc/Kc 블로킹, prefill batch 모드 | ⏳ |
-| 7.E. flash-style attention | 긴 컨텍스트 필수 | ⏳ |
-| 7.F. multi-thread prefill | physical core 활용 | ⏳ |
+| 7.G. Q8 N=1 4-acc kernel | block당 4 독립 sub-accumulator, ~2× | ✅ 완료 |
+| 7.J~P. v0.3.0 / v0.4.0 (multi-thread, VNNI, shape-aware) | ~60 → 65 tok/s @ 8t | ✅ 완료 |
+| 7.R~T. AVX-512 ZMM 시도 | Zen 4에서 회귀 (-4.5%), default-off (인프라 유지) | 🔴 measure-driven negative |
+| 7.U. Gap analysis | 1.376× 격차 = 메모리 bw 활용 효율 차이로 진단 | ✅ 완료 |
+| **8.A. ThreadPool 재설계 (mpsc → atomic counter)** | +9% 1t, +3% 8t, **격차 1.376×→1.304×** | ✅ **완료 (v0.5)** |
+| 8.B. chunk_rows L2-fit cap | -3.5% 회귀 → revert (인프라 유지) | 🔴 measure-driven negative |
+| 8.C. Software prefetch | 8t -49% → revert (인프라 유지) | 🔴 measure-driven negative |
+| 8.D. Prefill batching plumbing | pp32 2.9× 회귀 → LUMEN_PREFILL opt-in (인프라 유지) | 🔴 measure-driven negative |
+| 8.E.1. **N=1 fan-out dispatcher (prefill)** | pp32 22.65 → 54.15 tok/s (+2.4× 회복) | ✅ **완료 (v0.5)** |
+| 2.C. ARM64 backend | AAPCS64, NEON-readiness | ⏳ next |
+| 8.E.2. Q8 N>1 codegen rewrite | 7.G 4-acc 패턴을 N>1 path로 포팅 | ⏳ next |
+| Q4 native matmul | Q4_0 / Q4_K 활성화, 더 큰 모델 (1.5B, 3B) 실행 | ⏳ next |
 
 상세 계획: [PLAN.md](./PLAN.md) · 아키텍처: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) · 벤치: [BENCHMARK.md](./BENCHMARK.md)
 
-## 현재 성능 (v0.4.0, Qwen2.5-0.5B Q8_0)
+## 현재 성능 (v0.5.0, Qwen2.5-0.5B Q8_0, AMD Zen 4)
 
 **멀티 스레드 (8 threads):**
 
 | 경로 | tg32 tok/s | vs ggml 8t |
 |---|---:|---:|
 | Lumen JIT v0.3.0 (custom pool, Q8×F32 4-acc) | ~60 | 1.51× slower |
-| **Lumen JIT v0.4.0 (per-shape VNNI/fp32 dispatch)** | **~65** | **1.39× slower** |
-| llama.cpp 8-thread | 90.90 | 1.0× |
+| Lumen JIT v0.4.0 (per-shape VNNI/fp32 dispatch) | ~65 | 1.39× slower |
+| **Lumen JIT v0.5.0 (atomic ThreadPool + N=1 fan-out)** | **~67** | **1.30× slower** |
+| llama.cpp 8-thread | 87.9 | 1.0× |
 
-**단일 스레드 (`-t 1` ggml 비교용):**
+**단일 스레드 비교 — Lumen이 더 빠름:**
 
-| 경로 | tg32 tok/s |
-|---|---:|
-| Lumen naive Rust | 2.91 |
-| Lumen JIT v0.1.0 | 4.43 |
-| Lumen JIT v0.2.0 (Q8-native) | 17.97 |
-| Lumen JIT main (7.G-P) | ~65 (multi-thread; single-thread ~32) |
-| llama.cpp 1-thread | 41.32 |
+| 경로 | tg32 tok/s | vs Lumen |
+|---|---:|---:|
+| **Lumen JIT v0.5.0 (1 thread)** | **45.6** | **1.0×** |
+| llama.cpp 1-thread | 40.4 | **−11%** (Lumen 우세) |
 
-v0.1.0 → v0.4.0: **14.7× decode** (4.43 → 65.3 tok/s). 멀티스레드 Lumen은 single-thread ggml(41.32)을 **1.58× 능가**. 토큰은 naive ↔ JIT bit-identical. 자세한 해부는 [BENCHMARK.md](./BENCHMARK.md).
+v0.1.0 → v0.5.0 단일 스레드: **10.3× decode** (4.43 → 45.6 tok/s). 8 thread는 67 tok/s.
+
+**진단 (Phase 7.U + 8.D.5):**
+1.30× 격차의 정체는 **메모리 대역폭 활용 효율 차이**와 **Q8 N>1 kernel 미튜닝**. 단일 스레드에서는 Lumen이 ggml보다 빠르고, 멀티 스레드에서만 격차 발생. 다음 마일스톤(8.E.2 N>1 codegen rewrite)으로 좁힐 수 있을 것.
+
+토큰은 모든 commit에서 naive ↔ JIT bit-identical. 자세한 측정 해부는 [BENCHMARK.md](./BENCHMARK.md) · 회고 시리즈 인덱스는 [docs/blog/INDEX.md](./docs/blog/INDEX.md).
 
 ## Quick start
 

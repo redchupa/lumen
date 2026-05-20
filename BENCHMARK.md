@@ -1,43 +1,70 @@
 # Lumen Benchmarks
 
-Solid numbers, honestly reported. The runtime is at the bottom of its
-performance curve — we just got to "real LLM inference runs end-to-end"
-and only the Phase 3.C 4×8 register tile is wired into the main path so
-far. ggml has had five-plus years of cache-blocking, quantized-matmul,
-and microkernel tuning. The gap is meaningful and we own it.
+Solid numbers, honestly reported. v0.5.0 cycle compressed the gap to
+ggml from 1.376× (v0.4.0) to 1.304×, with single-threaded Lumen now
+**11% faster than single-threaded ggml** at decode. The 8-thread gap
+that remains is a memory-bandwidth-utilization difference + Q8 N>1
+kernel codegen that hasn't been microarchitecturally tuned yet —
+diagnosed across 11 measurement cycles, infrastructure left in place
+for the next milestone.
 
 ## Test environment
 
-- **Hardware**: Windows 11 Pro (host CPU detected by both binaries; both
-  run in default release mode)
+- **Hardware**: AMD Zen 4 (Ryzen / 7000-series), Windows 11 Pro
 - **Model**: `qwen2.5-0.5b-instruct-q8_0.gguf` (Qwen2.5-0.5B-Instruct,
-  Q8_0 quantization, ~640 MB on disk)
-- **Threads**: `1` (single-thread on both sides for an apples-to-apples
-  scalar-vs-scalar comparison; Lumen does not yet ship multi-thread
-  matmul)
+  Q8_0 quantization, ~670 MB on disk)
+- **Threads**: explicit per-row; default Lumen pool caps at 8.
 - **Lumen build**: `cargo test --release`
-- **llama.cpp build**: `b9174-bin-win-cpu-x64` (official AVX2 CPU release)
+- **llama.cpp build**: `b9174-bin-win-cpu-x64` (official AVX2 CPU release,
+  ggml-cpu-zen4.dll backend)
 
-## Headline numbers
+## Headline numbers (v0.5.0)
 
-### Single-thread decode (`-t 1` on the ggml side)
+### Single-thread decode — Lumen beats ggml here
 
 | Path | Decode (tg32) tok/s | vs llama.cpp |
 |---|---:|---:|
-| Lumen naive Rust matmul | 2.91 | 14.2× slower |
-| Lumen JIT (4×8 tile / 1×8 AVX2, 1-acc) | 4.43 | 9.3× slower |
-| Lumen JIT (+ 1×N 4-acc decode path, Phase 7.C) | 5.08 | 8.1× slower |
-| Lumen JIT (+ Q8-native fused matmul, Phase 7.D) | 17.97 | 2.30× slower |
-| Lumen JIT (+ 4-acc Q8 N=1 kernel, Phase 7.G) | 29.10 | 1.42× slower |
-| Lumen JIT (+ AVX2 SiLU/mul + RoPE precompute, 7.H/7.I) | ~31 | 1.32× slower |
-| llama.cpp (ggml, 1 thread) | 41.32 | 1.0× |
+| Lumen naive Rust matmul | 2.91 | 13.9× slower |
+| Lumen JIT (4×8 tile / 1×8 AVX2, 1-acc) | 4.43 | 9.1× slower |
+| Lumen JIT (+ Q8-native fused matmul, Phase 7.D) | 17.97 | 2.25× slower |
+| Lumen JIT (+ 4-acc Q8 N=1 kernel, Phase 7.G) | 29.10 | 1.39× slower |
+| Lumen JIT (+ AVX2 SiLU/mul + RoPE precompute, 7.H/7.I) | ~31 | 1.30× slower |
+| Lumen JIT v0.4.0 (shape-aware VNNI/fp32 dispatch) | 41.85 | 1.04× faster |
+| **Lumen JIT v0.5.0 (atomic ThreadPool, 1t)** | **45.64** | **1.13× faster (Lumen wins)** |
+| llama.cpp (ggml, 1 thread) | 40.40 | 1.0× |
 
-### Multi-thread decode (default thread count: 8 on this box)
+### Multi-thread decode (8 threads)
 
 | Path | Decode (tg32) tok/s | vs ggml @ 8t |
 |---|---:|---:|
-| **Lumen JIT v0.3 (rayon, M×K_blocks ≥ 100K parallel, Phase 7.J)** | **~56** | **1.62× slower** |
-| llama.cpp (ggml, 8 threads) | 90.90 | 1.0× |
+| Lumen JIT v0.3.0 (rayon, M×K_blocks ≥ 100K parallel) | ~56 | 1.62× slower |
+| Lumen JIT v0.4.0 (per-shape VNNI/fp32 dispatch) | 65.47 | 1.376× slower |
+| **Lumen JIT v0.5.0 (atomic ThreadPool + 8.E.1 fix)** | **67.38** | **1.304× slower** |
+| llama.cpp (ggml, 8 threads, ggml-cpu-zen4) | 87.86 | 1.0× |
+
+### Thread scaling (v0.5.0)
+
+| Threads | Lumen v0.5.0 | ggml | Winner |
+|---|---:|---:|---|
+| 1 | **45.64** | 40.40 | **Lumen +13%** |
+| 2 | 60.78 | 62.55 | ggml +3% |
+| 4 | 66.45 | 86.33 | ggml +30% |
+| 8 | 67.38 | 87.86 | ggml +30% |
+
+Lumen 1→8t scaling: 1.48× (efficiency 18.5%). ggml: 2.17× (27.2%).
+The 8t gap is entirely scaling efficiency, not kernel quality.
+
+### Prefill (Phase 8.E.1, opt-in `LUMEN_PREFILL=1`)
+
+| Path | pp32 tok/s |
+|---|---:|
+| v0.4.0 (no prefill — decode-by-token) | 65 |
+| Phase 8.D.3 first prefill attempt | 22.65 (regression, see 8.D retro) |
+| **Phase 8.E.1 (N=1 fan-out fix)** | **54.15** |
+| llama.cpp pp128 | 739 |
+
+Prefill is opt-in via `LUMEN_PREFILL=1`. Default behaviour unchanged.
+Real prefill win waits for 8.E.2 (N>1 codegen rewrite).
 
 Apples-to-apples sanity check: Lumen ~56 multi-thread is **1.36× faster
 than ggml's single-thread 41.32**. Single-thread Lumen (~31) is 1.32×
