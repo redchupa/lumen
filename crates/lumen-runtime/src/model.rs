@@ -278,25 +278,25 @@ fn use_vnni_for_matmul(d_in: usize) -> bool {
     (d_in / 32) <= 64
 }
 
-/// Phase 8.D.1: prefill (batched) variant of [`weight_matmul_jit_storage`].
-/// Same math as the naive `weight_matmul(a, w, rows, d_in, d_out)` —
-/// `a` is `[rows, d_in]` row-major, weight is `[d_out, d_in]` (or
-/// `[d_in, d_out]` after `transpose_in_place`), output is `[rows, d_out]`.
+/// Phase 8.D.1 / 8.E.1: prefill (batched) variant of
+/// [`weight_matmul_jit_storage`]. Same math as the naive
+/// `weight_matmul(a, w, rows, d_in, d_out)` — `a` is `[rows, d_in]`
+/// row-major, weight is `[d_out, d_in]` (or `[d_in, d_out]` after
+/// `transpose_in_place`), output is `[rows, d_out]`.
 ///
 /// F32 path (post-transpose layout `[d_in, d_out]`): direct call into the
 /// generic `compile_matmul(rows, d_in, d_out)` kernel — no reshaping.
 ///
-/// Q8 path (native `[d_out, d_in]` layout): the Q8 JIT kernel computes
-/// `W[d_out, d_in] @ B[d_in, n] = C[d_out, n]`. To make our `[rows, d_in]`
-/// activations and `[rows, d_out]` outputs line up we transpose the
-/// activation in and the output back. The cost is `O(rows · (d_in + d_out))`
-/// fp32 copies per matmul — small next to the `O(rows · d_in · d_out)`
-/// compute, and an easy place to optimize later if it shows up in profiles.
+/// Q8 path: each row of `a` is a separate N=1 matmul against the same
+/// weight matrix. We dispatch the 4-accumulator N=1 kernel `rows` times
+/// — Phase 8.D.5 measured this as 2.3-2.6× faster than the N=rows kernel
+/// (which never got Phase 7.G's microarchitectural rework). Same weights
+/// stay loaded across calls, so the L3-resident weight set still earns
+/// some reuse for large `rows`.
 ///
-/// `rows == 1` collapses to the decode path; the transposes become no-ops
-/// (single column == single row), so this can replace
-/// `weight_matmul_jit_storage` at no cost. The regression guard in
-/// `phase8d_q8_prefill::q8_n1_decode_still_matches_naive` covers that.
+/// `rows == 1` collapses to a single N=1 dispatch — exactly the decode
+/// path. Regression guard:
+/// `phase8d_q8_prefill::q8_n1_decode_still_matches_naive`.
 fn weight_matmul_jit_batched(
     a: &[f32],
     w: &WeightStorage,
@@ -323,56 +323,34 @@ fn weight_matmul_jit_batched(
             }
         }
         WeightStorage::Q8(weight_blocks) => {
-            // Q8 weight is `[d_out, d_in]`. The Q8 kernel signature is
-            // `W[m, k] @ B[k, n] -> C[m, n]`, so we plug:
-            //   m = d_out, k = d_in, n = rows
-            // and feed it `a` transposed from `[rows, d_in]` to `[d_in, rows]`.
-            let a_t = transpose_2d_view(a, rows, d_in);
+            // Phase 8.E.1: was a single N=rows kernel call with two transposes.
+            // Phase 8.D.5 measured that N=rows codegen at 2.3-2.6× slower
+            // than N=1 × rows across every Qwen projection shape, so we
+            // dispatch into the 4-acc N=1 kernel once per row instead.
+            // Side benefit: no activation/output transpose — each row of
+            // `a` is already a contiguous K-vector, ready to feed N=1
+            // verbatim. Same weights reused across calls (they're shared
+            // read-only), so the L3-resident weight set still benefits
+            // when row count is large.
             let f = jit
-                .get_or_compile_q8(d_out as u32, d_in as u32, rows as u32)
-                .expect("q8 matmul JIT compile (batched)");
-            let mut out_t = vec![0.0f32; d_out * rows];
-            // SAFETY: kernel compiled for (m=d_out, k=d_in, n=rows); buffers
-            // sized accordingly.
-            unsafe {
-                f(
-                    weight_blocks.as_ptr() as *const u8,
-                    a_t.as_ptr(),
-                    out_t.as_mut_ptr(),
-                );
+                .get_or_compile_q8(d_out as u32, d_in as u32, 1)
+                .expect("q8 matmul JIT compile (batched → N=1 fan-out)");
+            for r in 0..rows {
+                let a_row = &a[r * d_in..(r + 1) * d_in];
+                // SAFETY: kernel compiled for (M=d_out, K=d_in, N=1); each
+                // (a_row, out_row) pair is correctly sized and non-overlapping.
+                let out_row_ptr = unsafe { out.as_mut_ptr().add(r * d_out) };
+                unsafe {
+                    f(
+                        weight_blocks.as_ptr() as *const u8,
+                        a_row.as_ptr(),
+                        out_row_ptr,
+                    );
+                }
             }
-            // Transpose the result back to `[rows, d_out]`.
-            transpose_2d_into(&out_t, d_out, rows, &mut out);
         }
     }
     out
-}
-
-/// Transpose `[rows, cols]` row-major into a fresh `[cols, rows]` row-major
-/// allocation. Local helper for `weight_matmul_jit_batched`; the public
-/// `transpose_2d` above has fixed dim names that don't read well here.
-fn transpose_2d_view(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    debug_assert_eq!(src.len(), rows * cols);
-    let mut out = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c * rows + r] = src[r * cols + c];
-        }
-    }
-    out
-}
-
-/// Transpose `[rows, cols]` row-major into a caller-provided `[cols, rows]`
-/// row-major buffer. Avoids the extra allocation when the destination is
-/// already sized.
-fn transpose_2d_into(src: &[f32], rows: usize, cols: usize, dst: &mut [f32]) {
-    debug_assert_eq!(src.len(), rows * cols);
-    debug_assert_eq!(dst.len(), rows * cols);
-    for r in 0..rows {
-        for c in 0..cols {
-            dst[c * rows + r] = src[r * cols + c];
-        }
-    }
 }
 
 /// Activation-quantized variant of [`weight_matmul_jit_storage`]. Caller
