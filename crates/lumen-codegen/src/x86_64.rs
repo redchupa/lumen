@@ -736,7 +736,7 @@ fn emit_function_quant_matmul_q8(
     Ok(())
 }
 
-/// Body of the Q8 × F32 fused matmul.
+/// Body of the Q8 × F32 fused matmul (N > 1 / prefill).
 ///
 /// Stack layout (inside the function, after prologue + adjustment):
 /// - R12 = weights base (q8_0 blocks)
@@ -751,6 +751,26 @@ fn emit_function_quant_matmul_q8(
 ///   weight row byte offset (for row i) = i * (K/32) * 34.
 ///   block byte offset within row = kb * 34.
 /// Stride for activations: each row is N floats = 4*N bytes.
+///
+/// **Phase 8.D.5 measurement: this kernel runs 2.3-2.6× slower than
+/// `emit_quant_matmul_q8_n1_body` (the N=1 4-accumulator kernel) called
+/// `N` times across every Qwen2.5-0.5B projection shape (qkv, wo,
+/// gate/up, down). Diagnosis: this body uses one `ymm0` accumulator
+/// and processes K-elements one-at-a-time through scalar `vcvtsi2ss`
+/// + `vmulss` + `vbroadcastss` (5 instructions per element × 32
+/// elements per block, all into the same FMA dependency chain). The
+/// N=1 body got Phase 7.G's 4-acc YMM treatment that breaks the
+/// chain and loads weights 8-at-a-time via `vpmovsxbd`.
+///
+/// Until this codegen catches up (Phase 8.E.2 candidate: port the
+/// 4-acc + 8-wide load pattern over, with sub-accumulators rotating
+/// per K-chunk and an outer M-tile to keep ymm pressure bounded),
+/// `weight_matmul_jit_batched` deliberately routes batched calls
+/// through the N=1 kernel `rows` times instead (see Phase 8.E.1).
+/// This function is therefore on the unused path; it stays in tree
+/// because the IR lowering can still synthesize it and because the
+/// correctness tests in `phase8d_q8_prefill` continue to exercise
+/// the emit code path.**
 #[allow(clippy::too_many_arguments)]
 fn emit_quant_matmul_q8_body(
     em: &mut Emitter,
