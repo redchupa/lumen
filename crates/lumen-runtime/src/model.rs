@@ -1787,25 +1787,33 @@ impl Model {
         );
         let mut jit = MatmulJitCache::new();
 
-        // Phase 8.D.3: prefill via batched matmul whenever there are at least
-        // 8 prompt tokens left. The Q8 prefill kernel only takes N=1 or
-        // N%8==0, so we eat the largest 8-multiple first, then handle the
-        // tail one token at a time on the decode path. For short prompts
-        // (<8 tokens, e.g. the "안녕" 2-token bench) this is a pure no-op —
-        // we fall straight through to the per-token decode loop and match
-        // the v0.4.0 behaviour byte-for-byte.
+        // Phase 8.D.3 added prefill via batched matmul (chunks of N%8==0).
+        // Phase 8.D.5 measured the Q8 N>1 kernel as 2.3-2.6× slower than
+        // N=1 × N at every Qwen projection shape — the prefill path is a
+        // net regression on this microarchitecture until the codegen catches
+        // up (Phase 8.E). Until then the prefill chunking is opt-in via
+        // `LUMEN_PREFILL=1`; the default behaviour is the v0.4.0
+        // decode-by-token loop, byte-identical to before.
+        let prefill_enabled = std::env::var("LUMEN_PREFILL")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n >= 1)
+            .is_some();
+
         let mut last_logits = Vec::new();
         let mut pos = 0usize;
         let plen = prompt.len();
-        while plen - pos >= 8 {
-            let chunk_end = pos + ((plen - pos) / 8) * 8;
-            let chunk = &prompt[pos..chunk_end];
-            last_logits = self.forward_prefill_jit(chunk, pos as u32, &mut cache, &mut jit);
-            pos = chunk_end;
+        if prefill_enabled {
+            while plen - pos >= 8 {
+                let chunk_end = pos + ((plen - pos) / 8) * 8;
+                let chunk = &prompt[pos..chunk_end];
+                last_logits = self.forward_prefill_jit(chunk, pos as u32, &mut cache, &mut jit);
+                pos = chunk_end;
+            }
         }
-        // Remaining prompt tokens (0..8) fall through to the per-token decode
-        // path. This also covers the typical "short prompt + decode" case
-        // entirely with no behaviour change vs Phase 8.A.
+        // Remaining prompt tokens (or all of them when prefill is off): the
+        // per-token decode path. This is the default for short prompts and
+        // the only path when LUMEN_PREFILL is unset.
         while pos < plen {
             last_logits = self.forward_decode_jit(prompt[pos], pos as u32, &mut cache, &mut jit);
             pos += 1;
