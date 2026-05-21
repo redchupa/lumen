@@ -28,6 +28,7 @@
 - [phase7u/8a — 1.4× 격차 진단 + ThreadPool 재설계](./phase7u-8a-thread-scaling-memory-bw-ko.md) — 1t에서 Lumen +13% 발견, 격차는 memory bw 활용 효율
 - [phase8d — Prefill batching이 답이 아니었던 이유](./phase8d-prefill-batching-honest-ko.md) — pp32 -2.9× 회귀, attention 1%, N>1 kernel 2.5× 느림
 - [phase8d-8e1 — Prefill codegen story (English)](./phase8d-8e1-prefill-codegen-en.md) — 위 두 phase 영어 합본
+- [v0.5 cycle 마무리](./v0.5-cycle-closing-ko.md) — 11회 측정-주도 사이클 전체 결산, maintenance mode 진입
 
 ## 패턴 정리
 

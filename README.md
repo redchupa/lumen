@@ -119,6 +119,17 @@ The type checker enforces `a.shape[1] == b.shape[0]` and infers the result
 shape `[a.shape[0], b.shape[1]]` at compile time. Try changing `128` to `127`
 in either tensor — you get a typed error pointing at the exact source span.
 
+## Status (2026-05-21)
+
+v0.5.0 release-tagged. 메인 작성자는 다른 사이드 프로젝트로 호흡을 옮기는 중이고,
+Lumen은 **maintenance mode**입니다. 코드는 안정 — 11회 측정-주도 사이클로 다듬은
+상태. v1.0까지 남은 마일스톤(8.E.2 / ARM64 / Q4 native)은 [ROADMAP.md](./ROADMAP.md)에
+우선순위와 작업 추정치 정리. 외부 PR/이슈는 받습니다.
+
+다음 cycle을 직접 시도해보려는 분은 [docs/blog/INDEX.md](./docs/blog/INDEX.md)에서 11회
+사이클 회고 시리즈를 먼저 읽어보시는 걸 추천. 측정 데이터 + 진단 패턴이 다 들어
+있어서 같은 함정을 반복하지 않게 도움이 됩니다.
+
 ## Non-goals
 
 - 학습(training) 지원 — 추론 전용
